@@ -437,12 +437,24 @@ struct DeviceCaps
 
 // A windowed device and every call using it must remain on the native
 // window's message-pump thread. The window must outlive the device.
+// Without create_surface the window must be an HWND on Windows. With
+// create_surface the wrapper calls it after creating the Vulkan instance,
+// passing the instance and desc.window; the returned VkSurfaceKHR is owned
+// by the wrapper and the returned value must be castable to VkSurfaceKHR.
+// Any platform surface instance extensions required to create that surface
+// must be listed in instance_extensions. Surfaces reporting a client-driven
+// size (Wayland) require get_window_size; the wrapper calls it whenever it
+// needs the current drawable size in pixels during swap chain creation,
+// recreation, and extent queries.
 struct DeviceDesc
 {
     void* window = nullptr;
     Format swapchain_format = Format::undefined;
     uint32 desired_swapchain_image_count = 2; // 1..8 presentation contexts.
     uint32 timestamp_query_count = 256; // Per command buffer; zero disables timestamps.
+    Span<const char* const> instance_extensions = {}; // Additional instance extensions to enable.
+    void* (*create_surface)(void* vulkan_instance, void* window) = nullptr;
+    void (*get_window_size)(void* window, uint32x2* size) = nullptr;
 };
 
 struct DeviceInit

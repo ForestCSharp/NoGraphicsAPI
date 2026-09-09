@@ -1,5 +1,6 @@
 /build*/
 /cmake-build*/
+/tools/
 /.vs/
 CMakeFiles/
 /CMakeCache.txt
@@ -14,4 +15,6 @@ CMakeFiles/
 /.ninja_log
 /compile_commands.json
 /examples/*/shaders/
+/examples_glfw/glfw/
+/examples_glfw/*/shaders/
 /*.ppm

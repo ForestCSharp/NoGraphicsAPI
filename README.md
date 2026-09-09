@@ -210,7 +210,7 @@ Checked UMA heap sizes are 5.1 GiB on a Windows
 Current Windows RDNA 2 reports lack `VK_EXT_descriptor_heap`; the checked RDNA 3 and RDNA 4 AMD GPUs
 and all listed NVIDIA GPUs advertise every required extension. With Mesa
 [RADV 26.2 or newer](https://docs.mesa3d.org/relnotes/26.2.0.html), Steam Deck also has all required
-extensions. Linux/SteamOS window presentation is not implemented yet and is planned for a near-term update.
+extensions. Linux window presentation runs through the GLFW examples in `examples_glfw`.
 
 🔴 [Pascal / GeForce GTX 10](https://vulkan.gpuinfo.org/displayreport.php?id=51084) is below the NVIDIA
 floor: it lacks all four new extensions and exposes a 214 MiB fixed BAR.
@@ -219,7 +219,8 @@ Intel Windows support is not verified. The latest public
 [Arc report](https://vulkan.gpuinfo.org/displayreport.php?id=51355) lacks the descriptor-heap,
 device-address-command, and shader-untyped-pointer extensions. Mesa ANV
 [26.2 or newer](https://docs.mesa3d.org/relnotes/26.2.0.html) exposes the required extensions on Linux,
-but this repository currently lacks Linux swap chain support (to be implemented).
+but Linux window presentation is only implemented through `examples_glfw` and its
+`DeviceDesc::create_surface` / `get_window_size` hooks.
 
 [rdna2-rebar]: https://vulkan.gpuinfo.org/displayreport.php?id=42800
 [rdna2-fixed]: https://vulkan.gpuinfo.org/displayreport.php?id=48951

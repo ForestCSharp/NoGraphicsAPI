@@ -42,7 +42,7 @@ constexpr uint32 initial_command_context_count = 2;
 constexpr uint32 max_swapchain_images = 8;
 constexpr VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 constexpr uint32 gpu_allocation_alignment = 16;
-constexpr uint32 max_surface_formats = 64;
+constexpr uint32 max_surface_formats = 256;
 constexpr uint32 format_count = static_cast<uint32>(Format::undefined);
 
 [[nodiscard]] Error error_from_vk(VkResult result) noexcept
@@ -641,6 +641,8 @@ struct Device
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+    void* window = nullptr;
+    void (*get_window_size)(void* window, uint32x2* size) = nullptr;
     uint32 queue_family = 0;
     uint32 timestamp_query_count = 0;
     VkPhysicalDeviceMemoryProperties memory_properties{};
@@ -1739,7 +1741,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     assert(desc.desired_swapchain_image_count != 0 && desc.desired_swapchain_image_count <= max_swapchain_images &&
            "swapchain image count must fit the wrapper's presentation context array");
 #if !defined(_WIN32)
-    if (presentation)
+    if (presentation && !desc.create_surface)
         return {.error = Error::unsupported};
 #endif
 
@@ -1752,34 +1754,40 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 
     Device* state = new Device;
     state->timestamp_query_count = desc.timestamp_query_count;
+    state->window = desc.window;
+    state->get_window_size = desc.get_window_size;
     state->present_context_count = presentation ? desc.desired_swapchain_image_count : 0;
     VkExtensionProperties instance_extensions[max_instance_extensions]{};
     uint32 instance_extension_count = 0;
     error = enumerate_instance_extensions({instance_extensions, max_instance_extensions}, instance_extension_count);
     if (error != Error::none)
         return fail_device_creation(state, error);
-#if defined(_WIN32)
     const bool khr_surface_maintenance1 = presentation && has_name(
         {instance_extensions, instance_extension_count},
         VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
     const bool ext_surface_maintenance1 = presentation && has_name(
         {instance_extensions, instance_extension_count},
         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+#if defined(_WIN32)
+    const bool platform_surface_available = has_name(
+        {instance_extensions, instance_extension_count},
+        VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+#else
+    // Other platforms receive the platform surface extension through
+    // DeviceDesc::instance_extensions and create their surface through
+    // DeviceDesc::create_surface.
+    const bool platform_surface_available = desc.create_surface != nullptr;
+#endif
     if (presentation &&
         (!has_name({instance_extensions, instance_extension_count},
                    VK_KHR_SURFACE_EXTENSION_NAME) ||
-         !has_name({instance_extensions, instance_extension_count},
-                   VK_KHR_WIN32_SURFACE_EXTENSION_NAME) ||
+         !platform_surface_available ||
          !has_name({instance_extensions, instance_extension_count},
                    VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) ||
          (!khr_surface_maintenance1 && !ext_surface_maintenance1)))
     {
         return fail_device_creation(state, Error::unsupported);
     }
-#else
-    constexpr bool khr_surface_maintenance1 = false;
-    constexpr bool ext_surface_maintenance1 = false;
-#endif
 #if !defined(NDEBUG)
     VkLayerProperties layers[max_instance_layers]{};
     uint32 layer_count = 0;
@@ -1790,7 +1798,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     const bool validation_available = has_name({layers, layer_count}, "VK_LAYER_KHRONOS_validation");
 #endif
 
-    const char* enabled_instance_extensions[6]{};
+    const char* enabled_instance_extensions[12]{};
     uint32 enabled_instance_extension_count = 0;
     const char* enabled_layers[1]{};
     uint32 enabled_layer_count = 0;
@@ -1798,18 +1806,28 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     if (debug_utils_available) enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     if (validation_available) enabled_layers[enabled_layer_count++] = "VK_LAYER_KHRONOS_validation";
 #endif
-#if defined(_WIN32)
     if (presentation)
     {
         enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_SURFACE_EXTENSION_NAME;
-        enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#if defined(_WIN32)
+        if (!desc.create_surface)
+            enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#endif
         enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
         if (khr_surface_maintenance1)
             enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
         if (ext_surface_maintenance1)
             enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
     }
-#endif
+    for (size_t extension_index = 0; extension_index < desc.instance_extensions.size; ++extension_index)
+    {
+        const char* extension = desc.instance_extensions.data[extension_index];
+        bool already_enabled = false;
+        for (uint32 index = 0; index < enabled_instance_extension_count; ++index)
+            already_enabled = already_enabled || strcmp(enabled_instance_extensions[index], extension) == 0;
+        if (!already_enabled)
+            enabled_instance_extensions[enabled_instance_extension_count++] = extension;
+    }
 
     const VkApplicationInfo app_info{
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1853,7 +1871,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 #endif
 
 #if defined(_WIN32)
-    if (presentation)
+    if (presentation && !desc.create_surface)
     {
         const VkWin32SurfaceCreateInfoKHR surface_info{
             .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
@@ -1865,6 +1883,10 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             return fail_device_creation(state, error);
     }
 #endif
+    if (presentation && desc.create_surface)
+        state->surface = reinterpret_cast<VkSurfaceKHR>(desc.create_surface(state->instance, desc.window));
+    if (presentation && !state->surface)
+        return fail_device_creation(state, Error::driver_error);
 
     VkPhysicalDevice physical_devices[max_physical_devices]{};
     uint32 physical_device_count = 0;
@@ -1959,7 +1981,6 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
     }
     enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
-#if defined(_WIN32)
     if (presentation)
     {
         enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -1967,7 +1988,6 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
             : VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
     }
-#endif
     const VkDeviceCreateInfo device_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &enabled_features.core,
@@ -2223,17 +2243,40 @@ VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR supp
     abort();
 }
 
+// Wayland-style surfaces report a client-driven size through currentExtent
+// set to UINT_MAX; DeviceDesc::get_window_size must provide the drawable
+// size there. Other platforms report the size directly through the surface
+// capabilities.
+VkExtent2D current_surface_extent(const Device& device, const VkSurfaceCapabilitiesKHR& capabilities) noexcept
+{
+    VkExtent2D extent = capabilities.currentExtent;
+    if (extent.width == UINT_MAX || extent.height == UINT_MAX)
+    {
+        assert(device.get_window_size && "client-driven surface extents require DeviceDesc::get_window_size");
+        uint32x2 size{};
+        if (device.get_window_size)
+            device.get_window_size(device.window, &size);
+        extent.width = size.x;
+        extent.height = size.y;
+    }
+    if (extent.width != 0 && extent.height != 0)
+    {
+        extent.width = extent.width < capabilities.minImageExtent.width ? capabilities.minImageExtent.width :
+                       extent.width > capabilities.maxImageExtent.width ? capabilities.maxImageExtent.width : extent.width;
+        extent.height = extent.height < capabilities.minImageExtent.height ? capabilities.minImageExtent.height :
+                        extent.height > capabilities.maxImageExtent.height ? capabilities.maxImageExtent.height : extent.height;
+    }
+    return extent;
+}
+
 [[nodiscard]] bool swapchain_surface_configuration_changed(const Swapchain& swapchain) noexcept
 {
     VkSurfaceCapabilitiesKHR capabilities{};
     const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(swapchain.state->physical_device, swapchain.state->surface, &capabilities));
     require_error(error);
 
-    const VkExtent2D extent = capabilities.currentExtent;
-    const uint32 variable_extent = UINT_MAX;
-    return extent.width == variable_extent ||
-           extent.height == variable_extent ||
-           extent.width != swapchain.width ||
+    const VkExtent2D extent = current_surface_extent(*swapchain.state, capabilities);
+    return extent.width != swapchain.width ||
            extent.height != swapchain.height ||
            capabilities.currentTransform != swapchain.transform ||
            choose_composite_alpha(capabilities.supportedCompositeAlpha) != swapchain.composite_alpha;
@@ -2260,9 +2303,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         return error;
     const VkSurfaceCapabilitiesKHR& capabilities = capabilities_info.surfaceCapabilities;
 
-    const VkExtent2D extent = capabilities.currentExtent;
-    if (extent.width == UINT_MAX)
-        return Error::unsupported;
+    const VkExtent2D extent = current_surface_extent(device, capabilities);
     if (extent.width == 0 || extent.height == 0)
     {
         swapchain.width = 0;
@@ -2418,11 +2459,7 @@ uint32x2 get_drawable_extent(Device* device) noexcept
     VkSurfaceCapabilitiesKHR capabilities{};
     const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physical_device, device->surface, &capabilities));
     require_error(error);
-    const VkExtent2D extent = capabilities.currentExtent;
-    if (extent.width == UINT_MAX || extent.height == UINT_MAX)
-    {
-        require_error(Error::unsupported);
-    }
+    const VkExtent2D extent = current_surface_extent(*device, capabilities);
 
     Swapchain& swapchain = *device->swapchain;
     if (swapchain.handle && (swapchain.width != extent.width || swapchain.height != extent.height))

@@ -13,6 +13,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(NOGRAPHICSAPI_BUILD_EXAMPLES "Build NoGraphicsAPI examples" OFF)
+option(NOGRAPHICSAPI_BUILD_EXAMPLES_GLFW "Build NoGraphicsAPI GLFW examples" OFF)
 option(NOGRAPHICSAPI_BUILD_TESTS "Build NoGraphicsAPI tests" OFF)
 
 # CMake adds /EHsc to MSVC's default flags. Remove it before adding the explicit
@@ -75,6 +76,10 @@ add_subdirectory(utility)
 
 if(NOGRAPHICSAPI_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(NOGRAPHICSAPI_BUILD_EXAMPLES_GLFW)
+    add_subdirectory(examples_glfw)
 endif()
 
 if(NOGRAPHICSAPI_BUILD_TESTS)
