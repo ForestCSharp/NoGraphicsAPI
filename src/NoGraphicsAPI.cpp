@@ -14,6 +14,7 @@
 #include <vulkan/vulkan.h>
 
 #include <NoGraphicsAPI/bit.hpp>
+#include "BufferAddressMap.hpp"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,28 +32,73 @@ namespace gpu
 namespace
 {
 
+thread_local ErrorCallback error_callback = nullptr;
+
 constexpr uint32 max_device_extensions = 512;
 constexpr uint32 max_instance_extensions = 256;
 constexpr uint32 max_instance_layers = 64;
 constexpr uint32 max_physical_devices = 32;
 constexpr uint32 max_queue_families = 64;
+constexpr uint32 queue_type_count = 3; // General, compute-only, copy-only.
 constexpr uint32 max_color_attachments = 8;
-constexpr uint32 image_barrier_batch_size = 64;
-constexpr uint32 initial_command_context_count = 2;
 constexpr uint32 max_swapchain_images = 8;
 constexpr VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 constexpr uint32 gpu_allocation_alignment = 16;
 constexpr uint32 max_surface_formats = 256;
 constexpr uint32 format_count = static_cast<uint32>(Format::undefined);
 
-[[nodiscard]] Error error_from_vk(VkResult result) noexcept
+enum class DescriptorHeapType : uint8
 {
+    texture,
+    sampler,
+};
+
+void report_vk_failure(VkResult result, const char* operation, bool fatal, uint64 byte_count = 0) noexcept
+{
+    if (!error_callback) return;
+    const char* reason = "graphics driver error";
+    switch (result)
+    {
+    case VK_ERROR_INITIALIZATION_FAILED: reason = "VK_ERROR_INITIALIZATION_FAILED (graphics initialization failed)"; break;
+    case VK_ERROR_OUT_OF_HOST_MEMORY: reason = "VK_ERROR_OUT_OF_HOST_MEMORY (not enough system memory)"; break;
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: reason = "VK_ERROR_OUT_OF_DEVICE_MEMORY (not enough GPU memory or CPU-visible GPU memory)"; break;
+    case VK_ERROR_TOO_MANY_OBJECTS: reason = "VK_ERROR_TOO_MANY_OBJECTS (graphics resource limit reached)"; break;
+    case VK_ERROR_DEVICE_LOST: reason = "VK_ERROR_DEVICE_LOST (graphics device lost)"; break;
+    case VK_ERROR_MEMORY_MAP_FAILED: reason = "VK_ERROR_MEMORY_MAP_FAILED (GPU memory could not be mapped for CPU access)"; break;
+    case VK_ERROR_LAYER_NOT_PRESENT: reason = "VK_ERROR_LAYER_NOT_PRESENT (required Vulkan layer unavailable)"; break;
+    case VK_ERROR_EXTENSION_NOT_PRESENT: reason = "VK_ERROR_EXTENSION_NOT_PRESENT (required Vulkan extension unavailable)"; break;
+    case VK_ERROR_FEATURE_NOT_PRESENT: reason = "VK_ERROR_FEATURE_NOT_PRESENT (required graphics feature unavailable)"; break;
+    case VK_ERROR_INCOMPATIBLE_DRIVER: reason = "VK_ERROR_INCOMPATIBLE_DRIVER (incompatible graphics driver)"; break;
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: reason = "VK_ERROR_FORMAT_NOT_SUPPORTED (required texture or display format unsupported)"; break;
+    case VK_ERROR_INVALID_SHADER_NV: reason = "VK_ERROR_INVALID_SHADER_NV (the graphics driver rejected the shader)"; break;
+    case VK_ERROR_UNKNOWN: reason = "VK_ERROR_UNKNOWN (unspecified graphics driver error)"; break;
+    default: break;
+    }
+    char message[512];
+    if (byte_count)
+        snprintf(message, sizeof(message), "%s failed: %s (Vulkan result %d, %.2f MiB requested).",
+            operation, reason, int(result), double(byte_count) / (1024.0 * 1024.0));
+    else
+        snprintf(message, sizeof(message), "%s failed: %s (Vulkan result %d).", operation, reason, int(result));
+    error_callback(message, fatal);
+}
+
+[[noreturn]] void abort_vk_failure(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
+{
+    report_vk_failure(result, operation, true, byte_count);
+    assert(result == VK_SUCCESS && "unexpected Vulkan failure");
+    abort();
+}
+
+[[nodiscard]] Error error_from_vk(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
+{
+    if (result != VK_SUCCESS) report_vk_failure(result, operation, false, byte_count);
     switch (result)
     {
     case VK_SUCCESS: return Error::none;
     case VK_ERROR_OUT_OF_HOST_MEMORY:
     case VK_ERROR_OUT_OF_DEVICE_MEMORY:
-    case VK_ERROR_TOO_MANY_OBJECTS: abort();
+    case VK_ERROR_TOO_MANY_OBJECTS: return Error::out_of_memory;
     case VK_ERROR_DEVICE_LOST: return Error::device_lost;
     case VK_ERROR_LAYER_NOT_PRESENT:
     case VK_ERROR_EXTENSION_NOT_PRESENT:
@@ -63,17 +109,10 @@ constexpr uint32 format_count = static_cast<uint32>(Format::undefined);
     }
 }
 
-[[noreturn]] void abort_vk_failure(VkResult result) noexcept
-{
-    (void)result;
-    assert(result == VK_SUCCESS && "unexpected Vulkan failure");
-    abort();
-}
-
-void require_vk(VkResult result) noexcept
+void require_vk(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
 {
     if (result != VK_SUCCESS)
-        abort_vk_failure(result);
+        abort_vk_failure(result, operation, byte_count);
 }
 
 void assert_vk(VkResult result) noexcept
@@ -82,10 +121,16 @@ void assert_vk(VkResult result) noexcept
     (void)result;
 }
 
-void require_error(Error error) noexcept
+void require_error(Error error, const char* operation) noexcept
 {
     if (error != Error::none)
     {
+        if (error_callback)
+        {
+            char message[256];
+            snprintf(message, sizeof(message), "%s failed (graphics error %u).", operation, uint32(error));
+            error_callback(message, true);
+        }
         assert(false && "unexpected graphics API failure");
         abort();
     }
@@ -182,14 +227,12 @@ VkFormat to_vk(Format format)
     case Format::rgba16_uint: return VK_FORMAT_R16G16B16A16_UINT;
     case Format::r32_uint: return VK_FORMAT_R32_UINT;
     case Format::rg32_uint: return VK_FORMAT_R32G32_UINT;
-    case Format::rgb32_uint: return VK_FORMAT_R32G32B32_UINT;
     case Format::rgba32_uint: return VK_FORMAT_R32G32B32A32_UINT;
     case Format::r16_float: return VK_FORMAT_R16_SFLOAT;
     case Format::rg16_float: return VK_FORMAT_R16G16_SFLOAT;
     case Format::rgba16_float: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case Format::r32_float: return VK_FORMAT_R32_SFLOAT;
     case Format::rg32_float: return VK_FORMAT_R32G32_SFLOAT;
-    case Format::rgb32_float: return VK_FORMAT_R32G32B32_SFLOAT;
     case Format::rgba32_float: return VK_FORMAT_R32G32B32A32_SFLOAT;
     case Format::rgb10a2_unorm: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case Format::rg11b10_float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
@@ -382,6 +425,7 @@ constexpr VkPipelineStageFlags2 to_vk(Stage stages)
     if (has_flag(stages, Stage::indirect)) result |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
     if (has_flag(stages, Stage::index_input)) result |= VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
     if (has_flag(stages, Stage::vertex)) result |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    if (has_flag(stages, Stage::task)) result |= VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
     if (has_flag(stages, Stage::mesh)) result |= VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
     if (has_flag(stages, Stage::depth_stencil_tests)) result |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     if (has_flag(stages, Stage::fragment)) result |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -394,6 +438,7 @@ constexpr VkPipelineStageFlags2 to_vk(Stage stages)
 }
 
 static_assert(to_vk(Stage::all_commands) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+static_assert(to_vk(Stage::task) == VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
 static_assert(to_vk(Stage::all_commands | Stage::host) ==
               (VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT));
 
@@ -402,7 +447,8 @@ VkAccessFlags2 to_vk(Access accesses)
     VkAccessFlags2 result = 0;
     if (has_flag(accesses, Access::transfer_read)) result |= VK_ACCESS_2_TRANSFER_READ_BIT;
     if (has_flag(accesses, Access::transfer_write)) result |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    if (has_flag(accesses, Access::shader_read)) result |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    if (has_flag(accesses, Access::shader_read))
+        result |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT;
     if (has_flag(accesses, Access::shader_write)) result |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     if (has_flag(accesses, Access::color_read)) result |= VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
     if (has_flag(accesses, Access::color_write)) result |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -416,7 +462,7 @@ VkAccessFlags2 to_vk(Access accesses)
 }
 
 constexpr VkBufferUsageFlags universal_buffer_usage =
-    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
@@ -440,8 +486,7 @@ bool is_usable_memory_type(const VkPhysicalDeviceMemoryProperties& properties, u
 }
 
 constexpr VkAddressCommandFlagsKHR address_flags =
-    VK_ADDRESS_COMMAND_FULLY_BOUND_BIT_KHR |
-    VK_ADDRESS_COMMAND_STORAGE_BUFFER_USAGE_BIT_KHR;
+    VK_ADDRESS_COMMAND_FULLY_BOUND_BIT_KHR;
 } // namespace
 
 namespace detail
@@ -460,10 +505,10 @@ struct DeviceFunctions
     PFN_vkCmdDispatchIndirect2KHR cmd_dispatch_indirect = nullptr;
     PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
     PFN_vkCmdDrawMeshTasksIndirect2EXT cmd_draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectEXT cmd_draw_mesh_tasks_indirect_buffer = nullptr;
     PFN_vkCmdCopyMemoryKHR cmd_copy_memory = nullptr;
     PFN_vkCmdCopyMemoryToImageKHR cmd_copy_memory_to_image = nullptr;
     PFN_vkCmdCopyImageToMemoryKHR cmd_copy_image_to_memory = nullptr;
-    PFN_vkCmdCopyQueryPoolResultsToMemoryKHR cmd_copy_query_pool_results_to_memory = nullptr;
 };
 
 struct BackingBuffer
@@ -542,52 +587,6 @@ struct RetiredSwapchain
     uint32 view_count = 0;
 };
 
-struct TextureInitialization
-{
-    VkImage image = VK_NULL_HANDLE;
-    VkImageAspectFlags aspect_mask = 0;
-    uint32 mip_levels = 0;
-    uint32 array_layers = 0;
-    TextureInitialization* previous = nullptr;
-    TextureInitialization* next = nullptr;
-    struct TextureInitializationList* owner = nullptr;
-};
-
-struct TextureInitializationList
-{
-    TextureInitialization* first = nullptr;
-    TextureInitialization* last = nullptr;
-};
-
-void append_texture_initialization(TextureInitializationList& list, TextureInitialization& initialization) noexcept
-{
-    assert(!initialization.owner && !initialization.previous && !initialization.next);
-    initialization.owner = &list;
-    initialization.previous = list.last;
-    if (list.last)
-        list.last->next = &initialization;
-    else
-        list.first = &initialization;
-    list.last = &initialization;
-}
-
-void remove_texture_initialization(TextureInitialization& initialization) noexcept
-{
-    TextureInitializationList* list = initialization.owner;
-    assert(list);
-    if (initialization.previous)
-        initialization.previous->next = initialization.next;
-    else
-        list->first = initialization.next;
-    if (initialization.next)
-        initialization.next->previous = initialization.previous;
-    else
-        list->last = initialization.previous;
-    initialization.owner = nullptr;
-    initialization.previous = nullptr;
-    initialization.next = nullptr;
-}
-
 } // namespace detail
 
 struct Swapchain;
@@ -596,6 +595,23 @@ struct GpuHeapOwner
 {
     Device* state = nullptr;
     detail::BackingBuffer backing;
+    detail::BufferRecord* record = nullptr;
+};
+
+struct TextureDescriptorHeap
+{
+    Device* state = nullptr;
+    GpuHeap storage = {};
+    byte* descriptors = nullptr;
+    uint32 capacity = 0;
+};
+
+struct SamplerDescriptorHeap
+{
+    Device* state = nullptr;
+    GpuHeap storage = {};
+    byte* descriptors = nullptr;
+    uint32 capacity = 0;
 };
 
 struct TextureHeapOwner
@@ -614,18 +630,41 @@ struct CommandBuffer
 {
     Device* state = nullptr;
     CommandBuffer* next = nullptr;
-    CommandBuffer* previous = nullptr;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkCommandBuffer epilogue = VK_NULL_HANDLE;
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
-    VkDeviceAddress* timestamp_destinations = nullptr;
+    uint64** timestamp_destinations = nullptr;
+    uint64* timestamp_results = nullptr;
     uint32 timestamp_count = 0;
-    uint64 retire_value = 0;
     Swapchain* swapchain = nullptr;
+    bool submitted = false;
+    bool has_epilogue = false;
+};
+
+struct CommandPool
+{
+    Device* state = nullptr;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    CommandBuffer* first = nullptr;
+    CommandBuffer* last = nullptr;
+    CommandBuffer* next_buffer = nullptr;
+    bool timestamps = false;
 };
 
 namespace detail
 {
+
+struct Queue
+{
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32 family_index = 0;
+    bool timestamps = false;
+    VkCommandBufferSubmitInfo* command_submit_infos = nullptr;
+    size_t command_submit_capacity = 0;
+    VkSemaphoreSubmitInfo* wait_submit_infos = nullptr;
+    size_t wait_submit_capacity = 0;
+};
 
 struct PresentContext
 {
@@ -645,11 +684,13 @@ struct Device
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_messenger = nullptr;
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
+    detail::Queue* queues = nullptr;
+    uint32 queue_count = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     void* window = nullptr;
     void (*get_window_size)(void* window, uint32x2* size) = nullptr;
-    uint32 queue_family = 0;
+    uint32 queue_families[queue_type_count]{};
+    uint32 queue_family_count = 0;
     uint32 timestamp_query_count = 0;
     VkPhysicalDeviceMemoryProperties memory_properties{};
     VkPhysicalDeviceProperties physical_properties{};
@@ -658,23 +699,19 @@ struct Device
     uint64 texture_heap_alignment = 16;
     uint32 texture_memory_type = VK_MAX_MEMORY_TYPES;
     detail::DeviceFunctions fn;
+    detail::BufferAddressMap* buffer_map = nullptr;
     DeviceCaps caps;
     VkFormatFeatureFlags2 format_features[format_count]{};
     bool texture_compression_etc2 = false;
-    detail::TextureInitializationList pending_texture_initializations;
-    CommandBuffer* next_command_context = nullptr;
-    VkCommandBufferSubmitInfo* command_submit_infos = nullptr;
-    size_t command_submit_capacity = 0;
-    size_t command_context_count = 0;
-    VkSemaphore command_retirement = VK_NULL_HANDLE;
-    uint64 command_retirement_value = 0;
-    uint64 completed_command_retirement = 0;
+    bool swapchain_color_space_enabled = false;
+    VkSemaphore presentation_retirement = VK_NULL_HANDLE;
+    uint64 presentation_retirement_value = 0;
+    uint64 completed_presentation_retirement = 0;
     detail::SwapchainDeleteQueue swapchain_delete_queue;
     detail::PresentContext present_contexts[max_swapchain_images]{};
     detail::RetiredSwapchain retired_swapchains[max_swapchain_images]{};
     Swapchain* swapchain = nullptr;
     Swapchain* acquired_swapchain = nullptr;
-    uint32 active_command_buffers = 0;
     uint32 present_context_count = 0;
     uint32 next_present_context = 0;
 
@@ -725,7 +762,7 @@ struct Device
         return true;
     }
 
-    void create_backing_buffer(detail::BackingBuffer& output, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
+    bool create_backing_buffer(detail::BackingBuffer& output, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
                                VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags avoided = 0) const noexcept
     {
         output = {};
@@ -734,9 +771,11 @@ struct Device
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = size,
             .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .sharingMode = queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = queue_family_count,
+            .pQueueFamilyIndices = queue_families,
         };
-        require_vk(vkCreateBuffer(device, &buffer_info, nullptr, &result.buffer));
+        if (error_from_vk(vkCreateBuffer(device, &buffer_info, nullptr, &result.buffer), "vkCreateBuffer", size) != Error::none) return false;
 
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device, result.buffer, &requirements);
@@ -744,9 +783,19 @@ struct Device
         const bool has_memory_type = find_memory_type(
             requirements.memoryTypeBits, required, preferred,
             requirements.size, memory_type, avoided);
-        assert(has_memory_type);
         if (!has_memory_type)
-            abort();
+        {
+            if (error_callback)
+            {
+                char message[256];
+                snprintf(message, sizeof(message), "No compatible %s GPU memory heap can hold %.2f MiB.",
+                    (required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "CPU-visible" : "device-local",
+                    double(requirements.size) / (1024.0 * 1024.0));
+                error_callback(message, false);
+            }
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            return false;
+        }
 
         const VkMemoryAllocateFlagsInfo flags_info{
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
@@ -758,13 +807,28 @@ struct Device
             .allocationSize = requirements.size,
             .memoryTypeIndex = memory_type,
         };
-        require_vk(vkAllocateMemory(device, &allocate_info, nullptr, &result.memory));
-        require_vk(vkBindBufferMemory(device, result.buffer, result.memory, 0));
+        const char* operation = (required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            ? "vkAllocateMemory (CPU-visible GPU heap)" : "vkAllocateMemory (GPU-only heap)";
+        if (error_from_vk(vkAllocateMemory(device, &allocate_info, nullptr, &result.memory), operation, requirements.size) != Error::none)
+        {
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            return false;
+        }
+        if (error_from_vk(vkBindBufferMemory(device, result.buffer, result.memory, 0), "vkBindBufferMemory", requirements.size) != Error::none)
+        {
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            vkFreeMemory(device, result.memory, nullptr);
+            return false;
+        }
 
         if ((required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
         {
-            require_vk(vkMapMemory(
-                device, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+            if (error_from_vk(vkMapMemory(device, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped), "vkMapMemory", requirements.size) != Error::none)
+            {
+                vkDestroyBuffer(device, result.buffer, nullptr);
+                vkFreeMemory(device, result.memory, nullptr);
+                return false;
+            }
         }
 
         const VkBufferDeviceAddressInfo address_info{
@@ -773,21 +837,14 @@ struct Device
         };
         result.address = vkGetBufferDeviceAddress(device, &address_info);
         output = result;
+        return true;
     }
 
     [[nodiscard]] GpuHeap allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept;
-    [[nodiscard]] GpuHeap allocate_descriptor_heap(VkDeviceSize size, MemoryType memory) noexcept;
-    [[nodiscard]] Error create_command_contexts() noexcept;
-    [[nodiscard]] Error create_command_context(CommandBuffer& context) noexcept;
-    [[nodiscard]] Error grow_command_context_pool() noexcept;
-    void destroy_command_context(CommandBuffer& context) noexcept;
-    void destroy_command_contexts() noexcept;
-    void reset_command_context(CommandBuffer& context) noexcept;
-    void reset_retired_command_contexts() noexcept;
-    [[nodiscard]] CommandBuffer& acquire_command_context() noexcept;
-    [[nodiscard]] uint64 next_command_retirement() noexcept;
-    void poll_command_retirement() noexcept;
-    void wait_command_retirement(uint64 value) noexcept;
+    [[nodiscard]] GpuHeap allocate_descriptor_heap(VkDeviceSize size, DescriptorHeapType type) noexcept;
+    [[nodiscard]] uint64 next_presentation_retirement() noexcept;
+    void poll_presentation_retirement() noexcept;
+    void wait_presentation_retirement(uint64 value) noexcept;
     [[nodiscard]] Error create_present_context(detail::PresentContext& context) noexcept;
     void destroy_present_context(detail::PresentContext& context) noexcept;
     void finish_present_context(detail::PresentContext& context) noexcept;
@@ -807,7 +864,9 @@ VkMemoryRequirements buffer_memory_requirements(Device& device, VkBufferUsageFla
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = 1,
         .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
     };
     const VkDeviceBufferMemoryRequirements requirements_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS,
@@ -859,7 +918,7 @@ bool supports_image_create_info(Device& device, const VkImageCreateInfo& image_i
     const VkResult result = vkGetPhysicalDeviceImageFormatProperties2(device.physical_device, &format_info, &properties);
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED)
         return false;
-    require_vk(result);
+    if (error_from_vk(result, "vkGetPhysicalDeviceImageFormatProperties2") != Error::none) return false;
     if (output)
         *output = properties.imageFormatProperties;
     return fits_image_format_properties(image_info, properties.imageFormatProperties);
@@ -907,7 +966,9 @@ bool select_texture_memory_type(Device& device) noexcept
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = color_usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     if (!supports_image_create_info(device, image_info))
@@ -999,16 +1060,22 @@ void destroy_owned_swapchain(Device& device) noexcept;
 
 Device::~Device()
 {
-    assert(active_command_buffers == 0 && "device destroyed while a command buffer is active");
     assert(!acquired_swapchain && "device destroyed while a swapchain image is acquired");
     if (device)
     {
         drain_contexts();
         destroy_owned_swapchain(*this);
-        swapchain_delete_queue.collect(device, completed_command_retirement);
+        swapchain_delete_queue.collect(device, completed_presentation_retirement);
         assert(swapchain_delete_queue.count == 0);
     }
-    destroy_command_contexts();
+    if (device && presentation_retirement) vkDestroySemaphore(device, presentation_retirement, nullptr);
+    for (uint32 index = 0; index < queue_count; ++index)
+    {
+        free(queues[index].command_submit_infos);
+        free(queues[index].wait_submit_infos);
+    }
+    delete[] queues;
+    delete buffer_map;
     free(swapchain_delete_queue.entries);
     for (uint32 index = 0; index < present_context_count; ++index)
     {
@@ -1018,175 +1085,6 @@ Device::~Device()
     if (instance && surface) vkDestroySurfaceKHR(instance, surface, nullptr);
     if (instance && debug_messenger && destroy_debug_messenger) destroy_debug_messenger(instance, debug_messenger, nullptr);
     if (instance) vkDestroyInstance(instance, nullptr);
-}
-
-Error Device::create_command_contexts() noexcept
-{
-    assert(!next_command_context && !command_retirement && !command_context_count);
-    const VkSemaphoreTypeCreateInfo type_info{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-    };
-    const VkSemaphoreCreateInfo semaphore_info{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = &type_info,
-    };
-    Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &command_retirement));
-    if (error != Error::none)
-        return error;
-    for (uint32 index = 0; index < initial_command_context_count; ++index)
-    {
-        error = grow_command_context_pool();
-        if (error != Error::none)
-        {
-            destroy_command_contexts();
-            return error;
-        }
-    }
-    return Error::none;
-}
-
-Error Device::create_command_context(CommandBuffer& context) noexcept
-{
-    assert(!context.next && !context.previous && !context.command_pool &&
-           !context.command_buffer && !context.timestamp_pool && !context.state &&
-           context.retire_value == 0);
-    const VkCommandPoolCreateInfo pool_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = queue_family,
-    };
-    Error error = error_from_vk(vkCreateCommandPool(device, &pool_info, nullptr, &context.command_pool));
-    if (error != Error::none)
-        return error;
-    const VkCommandBufferAllocateInfo allocate_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = context.command_pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    error = error_from_vk(vkAllocateCommandBuffers(device, &allocate_info, &context.command_buffer));
-    if (error != Error::none)
-    {
-        destroy_command_context(context);
-        return error;
-    }
-    if (timestamp_query_count != 0)
-    {
-        const VkQueryPoolCreateInfo query_info{
-            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP,
-            .queryCount = timestamp_query_count,
-        };
-        error = error_from_vk(vkCreateQueryPool(device, &query_info, nullptr, &context.timestamp_pool));
-        if (error != Error::none)
-        {
-            destroy_command_context(context);
-            return error;
-        }
-        context.timestamp_destinations = static_cast<VkDeviceAddress*>(malloc(sizeof(VkDeviceAddress) * timestamp_query_count));
-    }
-    return error;
-}
-
-Error Device::grow_command_context_pool() noexcept
-{
-    CommandBuffer* context = new CommandBuffer;
-    const Error error = create_command_context(*context);
-    if (error != Error::none)
-    {
-        delete context;
-        return error;
-    }
-    if (command_context_count == command_submit_capacity)
-    {
-        command_submit_capacity = command_submit_capacity == 0 ? initial_command_context_count : command_submit_capacity * 2;
-        command_submit_infos = static_cast<VkCommandBufferSubmitInfo*>(realloc(command_submit_infos, command_submit_capacity * sizeof(*command_submit_infos)));
-    }
-    ++command_context_count;
-    if (!next_command_context)
-    {
-        context->next = context;
-        context->previous = context;
-        next_command_context = context;
-    }
-    else
-    {
-        context->next = next_command_context;
-        context->previous = next_command_context->previous;
-        context->previous->next = context;
-        next_command_context->previous = context;
-    }
-    return Error::none;
-}
-
-void Device::destroy_command_context(CommandBuffer& context) noexcept
-{
-    if (device && context.timestamp_pool) vkDestroyQueryPool(device, context.timestamp_pool, nullptr);
-    if (device && context.command_pool) vkDestroyCommandPool(device, context.command_pool, nullptr);
-    free(context.timestamp_destinations);
-    context = {};
-}
-
-void Device::destroy_command_contexts() noexcept
-{
-    if (next_command_context) next_command_context->previous->next = nullptr;
-    while (next_command_context)
-    {
-        CommandBuffer* context = next_command_context;
-        next_command_context = context->next;
-        destroy_command_context(*context);
-        delete context;
-    }
-    free(command_submit_infos);
-    command_submit_infos = nullptr;
-    command_submit_capacity = 0;
-    command_context_count = 0;
-    if (device && command_retirement) vkDestroySemaphore(device, command_retirement, nullptr);
-    command_retirement = VK_NULL_HANDLE;
-    command_retirement_value = 0;
-    completed_command_retirement = 0;
-}
-
-void Device::reset_command_context(CommandBuffer& context) noexcept
-{
-    assert(context.command_pool && context.command_buffer &&
-           !context.state &&
-           context.retire_value <= completed_command_retirement);
-    assert_vk(vkResetCommandPool(device, context.command_pool, 0));
-    context.retire_value = 0;
-}
-
-void Device::reset_retired_command_contexts() noexcept
-{
-    if (!next_command_context)
-        return;
-    CommandBuffer* context = next_command_context;
-    do
-    {
-        if (context->retire_value != 0 && context->retire_value <= completed_command_retirement)
-            reset_command_context(*context);
-        context = context->next;
-    } while (context != next_command_context);
-}
-
-CommandBuffer& Device::acquire_command_context() noexcept
-{
-    CommandBuffer* context = next_command_context;
-    assert(context);
-    if (active_command_buffers == 0 && context->retire_value > completed_command_retirement)
-        poll_command_retirement();
-    if (context->state || context->retire_value > completed_command_retirement)
-    {
-        require_error(grow_command_context_pool());
-        context = next_command_context->previous;
-        assert(context != next_command_context &&
-               context->next == next_command_context &&
-               context->retire_value == 0);
-    }
-    if (context->retire_value != 0) reset_command_context(*context);
-    next_command_context = context->next;
-    return *context;
 }
 
 namespace
@@ -1201,52 +1099,49 @@ uint64 query_timeline_value(const TimelineSemaphore& semaphore) noexcept
 
 } // namespace
 
-void Device::poll_command_retirement() noexcept
+void Device::poll_presentation_retirement() noexcept
 {
-    if (!command_retirement || completed_command_retirement == command_retirement_value)
+    if (!presentation_retirement || completed_presentation_retirement == presentation_retirement_value)
         return;
     uint64 completed = 0;
-    assert_vk(vkGetSemaphoreCounterValue(device, command_retirement, &completed));
-    assert(completed >= completed_command_retirement && completed <= command_retirement_value);
-    if (completed == completed_command_retirement)
+    assert_vk(vkGetSemaphoreCounterValue(device, presentation_retirement, &completed));
+    assert(completed >= completed_presentation_retirement && completed <= presentation_retirement_value);
+    if (completed == completed_presentation_retirement)
         return;
-    completed_command_retirement = completed;
-    reset_retired_command_contexts();
-    swapchain_delete_queue.collect(device, completed_command_retirement);
+    completed_presentation_retirement = completed;
+    swapchain_delete_queue.collect(device, completed_presentation_retirement);
 }
 
-void Device::wait_command_retirement(uint64 value) noexcept
+void Device::wait_presentation_retirement(uint64 value) noexcept
 {
-    assert(value <= command_retirement_value);
-    if (value <= completed_command_retirement)
+    assert(value <= presentation_retirement_value);
+    if (value <= completed_presentation_retirement)
     {
-        reset_retired_command_contexts();
-        swapchain_delete_queue.collect(device, completed_command_retirement);
+        swapchain_delete_queue.collect(device, completed_presentation_retirement);
         return;
     }
     const VkSemaphoreWaitInfo wait_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .semaphoreCount = 1,
-        .pSemaphores = &command_retirement,
+        .pSemaphores = &presentation_retirement,
         .pValues = &value,
     };
     assert_vk(vkWaitSemaphores(device, &wait_info, ~uint64{0}));
-    completed_command_retirement = value;
-    reset_retired_command_contexts();
-    swapchain_delete_queue.collect(device, completed_command_retirement);
+    completed_presentation_retirement = value;
+    swapchain_delete_queue.collect(device, completed_presentation_retirement);
 }
 
-uint64 Device::next_command_retirement() noexcept
+uint64 Device::next_presentation_retirement() noexcept
 {
-    const uint64 next = command_retirement_value + 1;
-    if (next - completed_command_retirement > max_timeline_value_difference)
+    const uint64 next = presentation_retirement_value + 1;
+    if (next - completed_presentation_retirement > max_timeline_value_difference)
     {
-        poll_command_retirement();
-        if (next - completed_command_retirement > max_timeline_value_difference)
-            wait_command_retirement(next - max_timeline_value_difference);
-        assert(next - completed_command_retirement <= max_timeline_value_difference);
+        poll_presentation_retirement();
+        if (next - completed_presentation_retirement > max_timeline_value_difference)
+            wait_presentation_retirement(next - max_timeline_value_difference);
+        assert(next - completed_presentation_retirement <= max_timeline_value_difference);
     }
-    command_retirement_value = next;
+    presentation_retirement_value = next;
     return next;
 }
 
@@ -1256,10 +1151,10 @@ Error Device::create_present_context(detail::PresentContext& context) noexcept
     const VkSemaphoreCreateInfo semaphore_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
     };
-    Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.acquired));
+    Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.acquired), "vkCreateSemaphore (acquire)");
     if (error != Error::none)
         return error;
-    error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.rendered));
+    error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.rendered), "vkCreateSemaphore (render)");
     if (error != Error::none)
     {
         destroy_present_context(context);
@@ -1268,7 +1163,7 @@ Error Device::create_present_context(detail::PresentContext& context) noexcept
     const VkFenceCreateInfo fence_info{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
-    error = error_from_vk(vkCreateFence(device, &fence_info, nullptr, &context.presented));
+    error = error_from_vk(vkCreateFence(device, &fence_info, nullptr, &context.presented), "vkCreateFence");
     if (error != Error::none) destroy_present_context(context);
     return error;
 }
@@ -1329,20 +1224,19 @@ void Device::poll_present_contexts() noexcept
 void Device::queue_retired_swapchain(detail::RetiredSwapchain& retired) noexcept
 {
     assert(retired.handle && retired.view_count != 0);
-    assert(active_command_buffers == 0 && "swapchain retirement is not allowed while a command buffer is recording");
     for (uint32 index = 0; index < retired.view_count; ++index)
     {
         const VkImageView view = retired.views[index];
         assert(view);
-        swapchain_delete_queue.push(command_retirement_value, retired.handle, view);
+        swapchain_delete_queue.push(presentation_retirement_value, retired.handle, view);
     }
     retired = {};
-    swapchain_delete_queue.collect(device, completed_command_retirement);
+    swapchain_delete_queue.collect(device, completed_presentation_retirement);
 }
 
 void Device::drain_contexts() noexcept
 {
-    wait_command_retirement(command_retirement_value);
+    wait_presentation_retirement(presentation_retirement_value);
     for (uint32 index = 0; index < present_context_count; ++index)
     {
         wait_present_context(present_contexts[index]);
@@ -1351,14 +1245,11 @@ void Device::drain_contexts() noexcept
     {
         assert(!retired.handle);
     }
-    swapchain_delete_queue.collect(device, completed_command_retirement);
+    swapchain_delete_queue.collect(device, completed_presentation_retirement);
 }
 
 GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
 {
-    if (memory == MemoryType::texture_descriptor_heap || memory == MemoryType::sampler_descriptor_heap)
-        return allocate_descriptor_heap(size, memory);
-
     VkMemoryPropertyFlags required = 0;
     VkMemoryPropertyFlags preferred = 0;
     VkMemoryPropertyFlags avoided = 0;
@@ -1381,7 +1272,12 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
     }
 
     GpuHeapOwner* heap = new GpuHeapOwner{.state = this};
-    create_backing_buffer(heap->backing, size, universal_buffer_usage, required, preferred, avoided);
+    if (!create_backing_buffer(heap->backing, size, universal_buffer_usage, required, preferred, avoided))
+    {
+        delete heap;
+        return {};
+    }
+    if (buffer_map) heap->record = buffer_map->insert(heap->backing.address, size, reinterpret_cast<uintptr>(heap->backing.buffer));
     return {
         .range = {
             .cpu = static_cast<byte*>(heap->backing.mapped),
@@ -1392,16 +1288,15 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
     };
 }
 
-GpuHeap Device::allocate_descriptor_heap(VkDeviceSize size, MemoryType memory) noexcept
+GpuHeap Device::allocate_descriptor_heap(VkDeviceSize size, DescriptorHeapType type) noexcept
 {
-    assert(memory == MemoryType::texture_descriptor_heap || memory == MemoryType::sampler_descriptor_heap);
-    const bool texture_heap = memory == MemoryType::texture_descriptor_heap;
     const VkDeviceSize resource_alignment = heap_properties.imageDescriptorAlignment > heap_properties.bufferDescriptorAlignment
                                                 ? heap_properties.imageDescriptorAlignment
                                                 : heap_properties.bufferDescriptorAlignment;
-    const VkDeviceSize reserved_alignment = texture_heap ? resource_alignment : heap_properties.samplerDescriptorAlignment;
-    const VkDeviceSize heap_alignment = texture_heap ? heap_properties.resourceHeapAlignment : heap_properties.samplerHeapAlignment;
-    const VkDeviceSize reserved_size = texture_heap ? heap_properties.minResourceHeapReservedRange : heap_properties.minSamplerHeapReservedRange;
+    const VkDeviceSize reserved_alignment = type == DescriptorHeapType::texture ? resource_alignment : heap_properties.samplerDescriptorAlignment;
+    const VkDeviceSize heap_alignment = type == DescriptorHeapType::texture ? heap_properties.resourceHeapAlignment : heap_properties.samplerHeapAlignment;
+    const VkDeviceSize reserved_size = type == DescriptorHeapType::texture
+        ? heap_properties.minResourceHeapReservedRange : heap_properties.minSamplerHeapReservedRange;
 
     const VkDeviceSize reserved_offset = align_up(size, reserved_alignment);
     const VkDeviceSize bind_size = reserved_offset + reserved_size;
@@ -1410,7 +1305,11 @@ GpuHeap Device::allocate_descriptor_heap(VkDeviceSize size, MemoryType memory) n
     const VkDeviceSize backing_size = bind_size + alignment_padding;
 
     GpuHeapOwner* heap = new GpuHeapOwner{.state = this};
-    create_backing_buffer(heap->backing, backing_size, universal_buffer_usage | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT, cpu_visible_memory_properties, 0);
+    if (!create_backing_buffer(heap->backing, backing_size, universal_buffer_usage | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT, cpu_visible_memory_properties, 0))
+    {
+        delete heap;
+        return {};
+    }
 
     const VkDeviceAddress gpu_address = align_up(heap->backing.address, allocation_alignment);
     const VkDeviceSize allocation_offset = gpu_address - heap->backing.address;
@@ -1434,11 +1333,9 @@ struct Texture
     uint32 layer_count = 0;
     TextureType type = TextureType::two_d;
     Format format = Format::rgba8_unorm;
-    detail::TextureInitialization initialization;
 
     ~Texture()
     {
-        if (initialization.owner) detail::remove_texture_initialization(initialization);
         vkDestroyImage(state->device, image, nullptr);
     }
 };
@@ -1464,6 +1361,7 @@ struct Swapchain
     uint32 width = 0;
     uint32 height = 0;
     Format format = Format::bgra8_srgb;
+    VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     detail::PresentContext* present_context = nullptr;
@@ -1493,11 +1391,28 @@ namespace
 
 void record_image_barriers(VkCommandBuffer command_buffer, Span<const VkImageMemoryBarrier2> barriers) noexcept
 {
-    assert((command_buffer && barriers.data && barriers.size != 0 && barriers.size <= UINT_MAX) && "image barrier batch is invalid");
+    assert(command_buffer && barriers.data && barriers.size != 0);
     const VkDependencyInfo dependency{
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .imageMemoryBarrierCount = static_cast<uint32>(barriers.size),
         .pImageMemoryBarriers = barriers.data,
+    };
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+}
+
+void record_barrier(VkCommandBuffer command_buffer, Stage before, Access before_access, Stage after, Access after_access) noexcept
+{
+    const VkMemoryBarrier2 memory_barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = to_vk(before),
+        .srcAccessMask = to_vk(before_access),
+        .dstStageMask = to_vk(after),
+        .dstAccessMask = to_vk(after_access),
+    };
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &memory_barrier,
     };
     vkCmdPipelineBarrier2(command_buffer, &dependency);
 }
@@ -1520,14 +1435,14 @@ Error enumerate_device_extensions(VkPhysicalDevice physical_device, Span<VkExten
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateDeviceExtensionProperties");
 }
 
 Error enumerate_instance_extensions(Span<VkExtensionProperties> values, uint32& count) noexcept
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateInstanceExtensionProperties(nullptr, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceExtensionProperties");
 }
 
 #if !defined(NDEBUG)
@@ -1535,7 +1450,7 @@ Error enumerate_instance_layers(Span<VkLayerProperties> values, uint32& count) n
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateInstanceLayerProperties(&count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceLayerProperties");
 }
 #endif
 
@@ -1553,14 +1468,14 @@ struct QueriedFeatures
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance1{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 
-    explicit QueriedFeatures(bool presentation, bool include_unified_image_layouts)
+    explicit QueriedFeatures(bool presentation, bool include_unified_image_layouts, bool include_address_commands)
     {
         core.pNext = &vulkan11;
         vulkan11.pNext = &vulkan12;
         vulkan12.pNext = &vulkan13;
         vulkan13.pNext = &vulkan14;
         vulkan14.pNext = &descriptor_heap;
-        descriptor_heap.pNext = &address_commands;
+        descriptor_heap.pNext = include_address_commands ? static_cast<void*>(&address_commands) : static_cast<void*>(&untyped_pointers);
         address_commands.pNext = &untyped_pointers;
         untyped_pointers.pNext = include_unified_image_layouts ? static_cast<void*>(&unified_image_layouts) : static_cast<void*>(&mesh_shader);
         unified_image_layouts.pNext = &mesh_shader;
@@ -1571,10 +1486,14 @@ struct QueriedFeatures
 struct Candidate
 {
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-    uint32 queue_family = 0;
+    uint32 queue_families[queue_type_count]{};
+    uint32 queue_counts[queue_type_count]{};
+    bool timestamps[queue_type_count]{};
+    uint32x3 copy_texture_granularity = {.x = 1, .y = 1, .z = 1};
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory_properties{};
     bool unified_image_layouts = false;
+    bool address_commands = false;
     bool image_cube_array = false;
     bool texture_compression_bc = false;
     bool texture_compression_astc = false;
@@ -1583,10 +1502,25 @@ struct Candidate
     bool khr_swapchain_maintenance1 = false;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
     VkPhysicalDeviceVulkan12Properties vulkan12_properties{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    const char* missing_extensions[5]{};
+    uint32 missing_extension_count = 0;
 };
 
+void append_capability_diagnostic(Span<char> message, const char* subject, Span<const char* const> missing_extensions) noexcept
+{
+    size_t length = strlen(message.data);
+    snprintf(message.data + length, message.size - length, "\n%s: %s", subject, missing_extensions.size
+        ? "missing required Vulkan extensions:"
+        : "required Vulkan 1.4, memory, shader, or presentation capabilities are unavailable.");
+    for (size_t index = 0; index < missing_extensions.size; ++index)
+    {
+        length = strlen(message.data);
+        snprintf(message.data + length, message.size - length, "\n  %s", missing_extensions.data[index]);
+    }
+}
+
 Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool khr_surface_maintenance1, bool ext_surface_maintenance1,
-                        Candidate& output) noexcept
+                        const DeviceDesc& desc, Candidate& output) noexcept
 {
     VkExtensionProperties extensions[max_device_extensions]{};
     uint32 extension_count = 0;
@@ -1598,25 +1532,26 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
         VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
     constexpr const char* required_extensions[]{
         VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
-        VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME,
         VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
         VK_EXT_MESH_SHADER_EXTENSION_NAME,
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
-    for (const char* name : required_extensions)
+    for (uint32 index = 0; index < (surface ? 4u : 3u); ++index)
     {
-        if (!has_name({extensions, extension_count}, name))
-            return Error::unsupported;
+        if (!has_name({extensions, extension_count}, required_extensions[index]))
+            output.missing_extensions[output.missing_extension_count++] = required_extensions[index];
     }
     const bool khr_swapchain_maintenance1 = khr_surface_maintenance1 &&
                                             has_name({extensions, extension_count}, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
     const bool ext_swapchain_maintenance1 = ext_surface_maintenance1 &&
                                             has_name({extensions, extension_count}, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
-    if (surface &&
-        (!has_name({extensions, extension_count}, VK_KHR_SWAPCHAIN_EXTENSION_NAME) ||
-         (!khr_swapchain_maintenance1 && !ext_swapchain_maintenance1)))
+    if (surface && !khr_swapchain_maintenance1 && !ext_swapchain_maintenance1)
     {
-        return Error::unsupported;
+        output.missing_extensions[output.missing_extension_count++] = khr_surface_maintenance1 && ext_surface_maintenance1
+            ? "VK_KHR_swapchain_maintenance1 or VK_EXT_swapchain_maintenance1"
+            : khr_surface_maintenance1 ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME : VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
     }
+    if (output.missing_extension_count) return Error::unsupported;
 
     Candidate result{
         .physical_device = physical_device,
@@ -1646,7 +1581,8 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
     }
     if (!cpu_visible_memory) return Error::unsupported;
 
-    QueriedFeatures features(surface != VK_NULL_HANDLE, unified_image_layouts_extension);
+    const bool address_commands_extension = has_name({extensions, extension_count}, VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME);
+    QueriedFeatures features(surface != VK_NULL_HANDLE, unified_image_layouts_extension, address_commands_extension);
     vkGetPhysicalDeviceFeatures2(physical_device, &features.core);
     const bool required_features =
         features.core.features.shaderInt16 == VK_TRUE &&
@@ -1671,7 +1607,6 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
         features.vulkan13.maintenance4 == VK_TRUE &&
         features.vulkan14.maintenance5 == VK_TRUE &&
         features.descriptor_heap.descriptorHeap == VK_TRUE &&
-        features.address_commands.deviceAddressCommands == VK_TRUE &&
         features.untyped_pointers.shaderUntypedPointers == VK_TRUE &&
         features.mesh_shader.meshShader == VK_TRUE &&
         (features.core.features.textureCompressionBC == VK_TRUE ||
@@ -1680,6 +1615,9 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
     if (!required_features)
         return Error::unsupported;
     result.unified_image_layouts = unified_image_layouts_extension && features.unified_image_layouts.unifiedImageLayouts == VK_TRUE;
+#if !defined(NOGRAPHICSAPI_TEST_BUFFER_COMMANDS)
+    result.address_commands = address_commands_extension && features.address_commands.deviceAddressCommands == VK_TRUE;
+#endif
     result.image_cube_array = features.core.features.imageCubeArray == VK_TRUE;
     result.texture_compression_bc = features.core.features.textureCompressionBC == VK_TRUE;
     result.texture_compression_astc = features.core.features.textureCompressionASTC_LDR == VK_TRUE;
@@ -1694,30 +1632,57 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
     VkQueueFamilyProperties queues[max_queue_families]{};
     uint32 queue_count = available_queue_count;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_count, queues);
-    uint32 queue_family = queue_count;
-    constexpr VkQueueFlags required_queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
     for (uint32 index = 0; index < queue_count; ++index)
     {
-        if (queues[index].queueCount == 0 || queues[index].timestampValidBits != 64 ||
-            (queues[index].queueFlags & required_queue_flags) != required_queue_flags)
+        if (queues[index].queueCount == 0)
             continue;
-        VkBool32 presentation_supported = VK_TRUE;
-        if (surface)
+        const VkQueueFlags flags = queues[index].queueFlags;
+        uint32 type = 0;
+        if (flags & VK_QUEUE_GRAPHICS_BIT)
         {
-            const Error presentation_error = error_from_vk(vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface, &presentation_supported));
+            if (!(flags & VK_QUEUE_COMPUTE_BIT)) continue;
+        }
+        else if (flags & VK_QUEUE_COMPUTE_BIT)
+        {
+            type = 1;
+        }
+        else if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+                 !(flags & ~(VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT | VK_QUEUE_PROTECTED_BIT)))
+        {
+            type = 2;
+        }
+        else
+        {
+            continue;
+        }
+        if (result.queue_counts[type] != 0) continue;
+        VkBool32 presentation_supported = VK_TRUE;
+        if (surface && type == 0)
+        {
+            const Error presentation_error = error_from_vk(vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface, &presentation_supported),
+                "vkGetPhysicalDeviceSurfaceSupportKHR");
             if (presentation_error != Error::none)
                 return presentation_error;
         }
         if (presentation_supported == VK_TRUE)
         {
-            queue_family = index;
-            break;
+            result.queue_families[type] = index;
+            result.queue_counts[type] = queues[index].queueCount;
+            result.timestamps[type] = desc.timestamp_query_count != 0 && queues[index].timestampValidBits == 64 && features.vulkan12.hostQueryReset;
+            if (type == 2)
+            {
+                result.copy_texture_granularity = {
+                    .x = queues[index].minImageTransferGranularity.width,
+                    .y = queues[index].minImageTransferGranularity.height,
+                    .z = queues[index].minImageTransferGranularity.depth,
+                };
+            }
         }
     }
-    if (queue_family == queue_count)
+    if (result.queue_counts[0] == 0 || (desc.desired_compute_queue_count && result.queue_counts[1] == 0) ||
+        (desc.desired_copy_queue_count && result.queue_counts[2] == 0))
         return Error::unsupported;
 
-    result.queue_family = queue_family;
     output = result;
     return Error::none;
 }
@@ -1726,11 +1691,13 @@ Error enumerate_physical_devices(VkInstance instance, Span<VkPhysicalDevice> val
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumeratePhysicalDevices(instance, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumeratePhysicalDevices");
 }
 
-DeviceInit fail_device_creation(Device* device, Error error) noexcept
+DeviceInit fail_device_creation(Device* device, Error error, const char* message = nullptr) noexcept
 {
+    if (error_callback && (message || error == Error::unsupported))
+        error_callback(message ? message : "Required Vulkan device, memory, or display capabilities are unavailable.", false);
     delete device;
     return {
         .error = error,
@@ -1741,8 +1708,14 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept;
 
 } // namespace
 
+void set_error_callback(ErrorCallback callback) noexcept
+{
+    error_callback = callback;
+}
+
 DeviceInit create_device(const DeviceDesc& desc) noexcept
 {
+    assert(desc.desired_queue_count != 0 && "create_device requires at least one queue");
     const bool presentation = desc.window != nullptr;
     assert(desc.desired_swapchain_image_count != 0 && desc.desired_swapchain_image_count <= max_swapchain_images &&
            "swapchain image count must fit the wrapper's presentation context array");
@@ -1752,11 +1725,14 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 #endif
 
     uint32 loader_version = VK_API_VERSION_1_0;
-    Error error = error_from_vk(vkEnumerateInstanceVersion(&loader_version));
+    Error error = error_from_vk(vkEnumerateInstanceVersion(&loader_version), "vkEnumerateInstanceVersion");
     if (error != Error::none)
         return { .error = error };
     if (loader_version < VK_API_VERSION_1_4)
+    {
+        if (error_callback) error_callback("Vulkan 1.4 or newer is required. Update the graphics driver.", false);
         return { .error = Error::unsupported };
+    }
 
     Device* state = new Device;
     state->timestamp_query_count = desc.timestamp_query_count;
@@ -1768,31 +1744,41 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     error = enumerate_instance_extensions({instance_extensions, max_instance_extensions}, instance_extension_count);
     if (error != Error::none)
         return fail_device_creation(state, error);
+    state->swapchain_color_space_enabled = presentation &&
+        has_name({instance_extensions, instance_extension_count}, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     const bool khr_surface_maintenance1 = presentation && has_name(
         {instance_extensions, instance_extension_count},
         VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
     const bool ext_surface_maintenance1 = presentation && has_name(
         {instance_extensions, instance_extension_count},
         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-#if defined(_WIN32)
-    const bool platform_surface_available = has_name(
-        {instance_extensions, instance_extension_count},
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
-#else
-    // Other platforms receive the platform surface extension through
-    // DeviceDesc::instance_extensions and create their surface through
-    // DeviceDesc::create_surface.
-    const bool platform_surface_available = desc.create_surface != nullptr;
-#endif
-    if (presentation &&
-        (!has_name({instance_extensions, instance_extension_count},
-                   VK_KHR_SURFACE_EXTENSION_NAME) ||
-         !platform_surface_available ||
-         !has_name({instance_extensions, instance_extension_count},
-                   VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) ||
-         (!khr_surface_maintenance1 && !ext_surface_maintenance1)))
+    if (presentation)
     {
-        return fail_device_creation(state, Error::unsupported);
+        const char* missing_extensions[5]{};
+        uint32 missing_extension_count = 0;
+        constexpr const char* required_extensions[]{
+            VK_KHR_SURFACE_EXTENSION_NAME,
+            VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
+        };
+#if defined(_WIN32)
+        if (!desc.create_surface && !has_name({instance_extensions, instance_extension_count}, VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
+            missing_extensions[missing_extension_count++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#endif
+        for (const char* name : required_extensions)
+        {
+            if (!has_name({instance_extensions, instance_extension_count}, name))
+                missing_extensions[missing_extension_count++] = name;
+        }
+        if (!khr_surface_maintenance1 && !ext_surface_maintenance1)
+            missing_extensions[missing_extension_count++] = "VK_KHR_surface_maintenance1 or VK_EXT_surface_maintenance1";
+        if (desc.swapchain_color_space != ColorSpace::srgb && !state->swapchain_color_space_enabled)
+            missing_extensions[missing_extension_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+        if (missing_extension_count)
+        {
+            char message[1024] = "Cannot initialize Vulkan presentation.";
+            append_capability_diagnostic(message, "Vulkan instance", {missing_extensions, missing_extension_count});
+            return fail_device_creation(state, Error::unsupported, message);
+        }
     }
 #if !defined(NDEBUG)
     VkLayerProperties layers[max_instance_layers]{};
@@ -1804,7 +1790,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     const bool validation_available = has_name({layers, layer_count}, "VK_LAYER_KHRONOS_validation");
 #endif
 
-    const char* enabled_instance_extensions[12]{};
+    const char* enabled_instance_extensions[13]{};
     uint32 enabled_instance_extension_count = 0;
     const char* enabled_layers[1]{};
     uint32 enabled_layer_count = 0;
@@ -1814,6 +1800,8 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 #endif
     if (presentation)
     {
+        if (state->swapchain_color_space_enabled)
+            enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
         enabled_instance_extensions[enabled_instance_extension_count++] = VK_KHR_SURFACE_EXTENSION_NAME;
 #if defined(_WIN32)
         if (!desc.create_surface)
@@ -1851,7 +1839,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         .enabledExtensionCount = enabled_instance_extension_count,
         .ppEnabledExtensionNames = enabled_instance_extension_count ? enabled_instance_extensions : nullptr,
     };
-    error = error_from_vk(vkCreateInstance(&instance_info, nullptr, &state->instance));
+    error = error_from_vk(vkCreateInstance(&instance_info, nullptr, &state->instance), "vkCreateInstance");
     if (error != Error::none)
         return fail_device_creation(state, error);
 
@@ -1870,7 +1858,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = debug_callback,
         };
-        error = error_from_vk(create_debug(state->instance, &debug_info, nullptr, &state->debug_messenger));
+        error = error_from_vk(create_debug(state->instance, &debug_info, nullptr, &state->debug_messenger), "vkCreateDebugUtilsMessengerEXT");
         if (error != Error::none)
             return fail_device_creation(state, error);
     }
@@ -1884,7 +1872,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             .hinstance = GetModuleHandleW(nullptr),
             .hwnd = static_cast<HWND>(desc.window),
         };
-        error = error_from_vk(vkCreateWin32SurfaceKHR(state->instance, &surface_info, nullptr, &state->surface));
+        error = error_from_vk(vkCreateWin32SurfaceKHR(state->instance, &surface_info, nullptr, &state->surface), "vkCreateWin32SurfaceKHR");
         if (error != Error::none)
             return fail_device_creation(state, error);
     }
@@ -1902,13 +1890,23 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 
     Candidate selected{};
     bool has_selected = false;
+    char candidate_diagnostics[2048] = "No compatible GPU found.";
     for (uint32 index = 0; index < physical_device_count; ++index)
     {
         const VkPhysicalDevice physical_device = physical_devices[index];
         Candidate candidate{};
-        error = inspect_candidate(physical_device, state->surface, khr_surface_maintenance1, ext_surface_maintenance1, candidate);
+        error = inspect_candidate(physical_device, state->surface, khr_surface_maintenance1, ext_surface_maintenance1, desc, candidate);
         if (error == Error::unsupported)
+        {
+            if (error_callback)
+            {
+                VkPhysicalDeviceProperties properties{};
+                vkGetPhysicalDeviceProperties(physical_device, &properties);
+                append_capability_diagnostic(candidate_diagnostics, properties.deviceName,
+                    {candidate.missing_extensions, candidate.missing_extension_count});
+            }
             continue;
+        }
         if (error != Error::none)
             return fail_device_creation(state, error);
         if (!has_selected || candidate.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
@@ -1920,10 +1918,9 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             break;
     }
     if (!has_selected)
-        return fail_device_creation(state, Error::unsupported);
+        return fail_device_creation(state, Error::unsupported, candidate_diagnostics);
 
     state->physical_device = selected.physical_device;
-    state->queue_family = selected.queue_family;
     state->physical_properties = selected.properties;
     state->heap_properties = selected.heap_properties;
     state->max_timeline_value_difference = selected.vulkan12_properties.maxTimelineSemaphoreValueDifference;
@@ -1935,7 +1932,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             state->physical_device, static_cast<Format>(value));
     }
 
-    QueriedFeatures enabled_features(presentation, selected.unified_image_layouts);
+    QueriedFeatures enabled_features(presentation, selected.unified_image_layouts, selected.address_commands);
     state->texture_compression_etc2 = selected.texture_compression_etc2;
     enabled_features.core.features.imageCubeArray = selected.image_cube_array;
     enabled_features.core.features.samplerAnisotropy = VK_TRUE;
@@ -1958,29 +1955,49 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.vulkan12.shaderFloat16 = VK_TRUE;
     enabled_features.vulkan12.scalarBlockLayout = VK_TRUE;
     enabled_features.vulkan12.timelineSemaphore = VK_TRUE;
+    enabled_features.vulkan12.hostQueryReset = selected.timestamps[0] || selected.timestamps[1] || selected.timestamps[2];
     enabled_features.vulkan12.bufferDeviceAddress = VK_TRUE;
     enabled_features.vulkan13.synchronization2 = VK_TRUE;
     enabled_features.vulkan13.dynamicRendering = VK_TRUE;
     enabled_features.vulkan13.maintenance4 = VK_TRUE;
     enabled_features.vulkan14.maintenance5 = VK_TRUE;
     enabled_features.descriptor_heap.descriptorHeap = VK_TRUE;
-    enabled_features.address_commands.deviceAddressCommands = VK_TRUE;
+    enabled_features.address_commands.deviceAddressCommands = selected.address_commands;
     enabled_features.untyped_pointers.shaderUntypedPointers = VK_TRUE;
     enabled_features.unified_image_layouts.unifiedImageLayouts = selected.unified_image_layouts ? VK_TRUE : VK_FALSE;
+    enabled_features.mesh_shader.taskShader = VK_TRUE;
     enabled_features.mesh_shader.meshShader = VK_TRUE;
     enabled_features.swapchain_maintenance1.swapchainMaintenance1 = VK_TRUE;
 
-    constexpr float queue_priority = 1.0f;
-    const VkDeviceQueueCreateInfo queue_info{
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = state->queue_family,
-        .queueCount = 1,
-        .pQueuePriorities = &queue_priority,
-    };
+    const uint32 requested_counts[]{desc.desired_queue_count, desc.desired_compute_queue_count, desc.desired_copy_queue_count};
+    uint32 queue_counts[queue_type_count]{};
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        queue_counts[type] = requested_counts[type] < selected.queue_counts[type] ? requested_counts[type] : selected.queue_counts[type];
+        state->queue_count += queue_counts[type];
+    }
+    state->queues = new detail::Queue[state->queue_count];
+    float* queue_priorities = new float[state->queue_count];
+    for (uint32 index = 0; index < state->queue_count; ++index)
+        queue_priorities[index] = 1.0f;
+    VkDeviceQueueCreateInfo queue_infos[queue_type_count]{};
+    uint32 first_queue = 0;
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        if (queue_counts[type] == 0) continue;
+        state->queue_families[state->queue_family_count] = selected.queue_families[type];
+        queue_infos[state->queue_family_count++] = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = selected.queue_families[type],
+            .queueCount = queue_counts[type],
+            .pQueuePriorities = queue_priorities + first_queue,
+        };
+        first_queue += queue_counts[type];
+    }
     const char* enabled_device_extensions[7]{};
     uint32 enabled_device_extension_count = 0;
     enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME;
-    enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME;
+    if (selected.address_commands) enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME;
     enabled_device_extensions[enabled_device_extension_count++] = VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME;
     if (selected.unified_image_layouts)
     {
@@ -1997,15 +2014,26 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     const VkDeviceCreateInfo device_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &enabled_features.core,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_info,
+        .queueCreateInfoCount = state->queue_family_count,
+        .pQueueCreateInfos = queue_infos,
         .enabledExtensionCount = enabled_device_extension_count,
         .ppEnabledExtensionNames = enabled_device_extensions,
     };
-    error = error_from_vk(vkCreateDevice(state->physical_device, &device_info, nullptr, &state->device));
+    error = error_from_vk(vkCreateDevice(state->physical_device, &device_info, nullptr, &state->device), "vkCreateDevice");
+    delete[] queue_priorities;
     if (error != Error::none)
         return fail_device_creation(state, error);
-    vkGetDeviceQueue(state->device, state->queue_family, 0, &state->queue);
+    first_queue = 0;
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        for (uint32 index = 0; index < queue_counts[type]; ++index)
+        {
+            detail::Queue& queue = state->queues[first_queue++];
+            queue.family_index = selected.queue_families[type];
+            queue.timestamps = selected.timestamps[type];
+            vkGetDeviceQueue(state->device, queue.family_index, index, &queue.queue);
+        }
+    }
     if (!supports_gpu_heap_memory(*state) || !select_texture_memory_type(*state))
         return fail_device_creation(state, Error::unsupported);
 
@@ -2014,55 +2042,82 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     state->fn.cmd_bind_sampler_heap = load_device_proc<PFN_vkCmdBindSamplerHeapEXT>(state->device, "vkCmdBindSamplerHeapEXT");
     state->fn.cmd_bind_texture_heap = load_device_proc<PFN_vkCmdBindResourceHeapEXT>(state->device, "vkCmdBindResourceHeapEXT");
     state->fn.cmd_push_data = load_device_proc<PFN_vkCmdPushDataEXT>(state->device, "vkCmdPushDataEXT");
-    state->fn.cmd_bind_index_buffer = load_device_proc<PFN_vkCmdBindIndexBuffer3KHR>(state->device, "vkCmdBindIndexBuffer3KHR");
-    state->fn.cmd_draw_indirect = load_device_proc<PFN_vkCmdDrawIndirect2KHR>(state->device, "vkCmdDrawIndirect2KHR");
-    state->fn.cmd_draw_indexed_indirect = load_device_proc<PFN_vkCmdDrawIndexedIndirect2KHR>(state->device, "vkCmdDrawIndexedIndirect2KHR");
-    state->fn.cmd_dispatch_indirect = load_device_proc<PFN_vkCmdDispatchIndirect2KHR>(state->device, "vkCmdDispatchIndirect2KHR");
     state->fn.cmd_draw_mesh_tasks = load_device_proc<PFN_vkCmdDrawMeshTasksEXT>(state->device, "vkCmdDrawMeshTasksEXT");
-    state->fn.cmd_draw_mesh_tasks_indirect = load_device_proc<PFN_vkCmdDrawMeshTasksIndirect2EXT>(state->device, "vkCmdDrawMeshTasksIndirect2EXT");
-    state->fn.cmd_copy_memory = load_device_proc<PFN_vkCmdCopyMemoryKHR>(state->device, "vkCmdCopyMemoryKHR");
-    state->fn.cmd_copy_memory_to_image = load_device_proc<PFN_vkCmdCopyMemoryToImageKHR>(state->device, "vkCmdCopyMemoryToImageKHR");
-    state->fn.cmd_copy_image_to_memory = load_device_proc<PFN_vkCmdCopyImageToMemoryKHR>(state->device, "vkCmdCopyImageToMemoryKHR");
-    state->fn.cmd_copy_query_pool_results_to_memory =
-        load_device_proc<PFN_vkCmdCopyQueryPoolResultsToMemoryKHR>(state->device, "vkCmdCopyQueryPoolResultsToMemoryKHR");
     if (!state->fn.write_sampler_descriptors || !state->fn.write_resource_descriptors ||
         !state->fn.cmd_bind_sampler_heap || !state->fn.cmd_bind_texture_heap ||
-        !state->fn.cmd_push_data || !state->fn.cmd_bind_index_buffer ||
-        !state->fn.cmd_draw_indirect || !state->fn.cmd_draw_indexed_indirect ||
-        !state->fn.cmd_dispatch_indirect || !state->fn.cmd_draw_mesh_tasks ||
-        !state->fn.cmd_draw_mesh_tasks_indirect || !state->fn.cmd_copy_memory ||
-        !state->fn.cmd_copy_memory_to_image || !state->fn.cmd_copy_image_to_memory || !state->fn.cmd_copy_query_pool_results_to_memory)
+        !state->fn.cmd_push_data || !state->fn.cmd_draw_mesh_tasks)
     {
-        return fail_device_creation(state, Error::driver_error);
+        return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide the required Vulkan command entry points.");
+    }
+    if (selected.address_commands)
+    {
+        state->fn.cmd_bind_index_buffer = load_device_proc<PFN_vkCmdBindIndexBuffer3KHR>(state->device, "vkCmdBindIndexBuffer3KHR");
+        state->fn.cmd_draw_indirect = load_device_proc<PFN_vkCmdDrawIndirect2KHR>(state->device, "vkCmdDrawIndirect2KHR");
+        state->fn.cmd_draw_indexed_indirect = load_device_proc<PFN_vkCmdDrawIndexedIndirect2KHR>(state->device, "vkCmdDrawIndexedIndirect2KHR");
+        state->fn.cmd_dispatch_indirect = load_device_proc<PFN_vkCmdDispatchIndirect2KHR>(state->device, "vkCmdDispatchIndirect2KHR");
+        state->fn.cmd_draw_mesh_tasks_indirect = load_device_proc<PFN_vkCmdDrawMeshTasksIndirect2EXT>(state->device, "vkCmdDrawMeshTasksIndirect2EXT");
+        state->fn.cmd_copy_memory = load_device_proc<PFN_vkCmdCopyMemoryKHR>(state->device, "vkCmdCopyMemoryKHR");
+        state->fn.cmd_copy_memory_to_image = load_device_proc<PFN_vkCmdCopyMemoryToImageKHR>(state->device, "vkCmdCopyMemoryToImageKHR");
+        state->fn.cmd_copy_image_to_memory = load_device_proc<PFN_vkCmdCopyImageToMemoryKHR>(state->device, "vkCmdCopyImageToMemoryKHR");
+        if (!state->fn.cmd_bind_index_buffer || !state->fn.cmd_draw_indirect || !state->fn.cmd_draw_indexed_indirect ||
+            !state->fn.cmd_dispatch_indirect || !state->fn.cmd_draw_mesh_tasks_indirect || !state->fn.cmd_copy_memory ||
+            !state->fn.cmd_copy_memory_to_image || !state->fn.cmd_copy_image_to_memory)
+        {
+            return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide the enabled Vulkan device address commands.");
+        }
+    }
+    else
+    {
+        state->fn.cmd_draw_mesh_tasks_indirect_buffer = load_device_proc<PFN_vkCmdDrawMeshTasksIndirectEXT>(state->device, "vkCmdDrawMeshTasksIndirectEXT");
+        if (!state->fn.cmd_draw_mesh_tasks_indirect_buffer)
+            return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide vkCmdDrawMeshTasksIndirectEXT.");
+        state->buffer_map = new detail::BufferAddressMap{};
     }
 
-    error = state->create_command_contexts();
-    if (error != Error::none)
-        return fail_device_creation(state, error);
-    for (uint32 index = 0; index < state->present_context_count; ++index)
+    if (presentation)
     {
-        error = state->create_present_context(state->present_contexts[index]);
+        const VkSemaphoreTypeCreateInfo type_info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        };
+        const VkSemaphoreCreateInfo semaphore_info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &type_info,
+        };
+        error = error_from_vk(vkCreateSemaphore(state->device, &semaphore_info, nullptr, &state->presentation_retirement), "vkCreateSemaphore (presentation)");
         if (error != Error::none)
             return fail_device_creation(state, error);
+        for (uint32 index = 0; index < state->present_context_count; ++index)
+        {
+            error = state->create_present_context(state->present_contexts[index]);
+            if (error != Error::none)
+                return fail_device_creation(state, error);
+        }
     }
 
     state->caps = {
         .device_name = state->physical_properties.deviceName,
+        .queue_count = state->queue_count,
+        .general_queue_count = queue_counts[0],
+        .compute_queue_count = queue_counts[1],
+        .copy_queue_count = queue_counts[2],
+        .copy_texture_granularity = selected.copy_texture_granularity,
         .max_push_data_size = state->heap_properties.maxPushDataSize,
         .texture_heap_alignment = state->texture_heap_alignment,
-        .texture_descriptor_size = state->heap_properties.imageDescriptorSize,
-        .sampler_descriptor_size = state->heap_properties.samplerDescriptorSize,
         .timestamp_period_ns = selected.properties.limits.timestampPeriod,
         .sub_texel_precision_bits = selected.properties.limits.subTexelPrecisionBits,
         .texture_compression_bc = selected.texture_compression_bc,
         .texture_compression_astc = selected.texture_compression_astc,
         .storage_input_output16 = selected.storage_input_output16,
+        .indirect_mesh_draw = true,
     };
     if (presentation)
     {
         state->swapchain = new Swapchain;
         state->swapchain->state = state;
         state->swapchain->format = desc.swapchain_format;
+        state->swapchain->color_space = desc.swapchain_color_space == ColorSpace::extended_srgb_linear
+            ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         error = recreate_swapchain(*state->swapchain);
         if (error != Error::none)
             return fail_device_creation(state, error);
@@ -2093,7 +2148,11 @@ TimelineSemaphore* create_timeline_semaphore(Device* device, uint64 initial_valu
     TimelineSemaphore* result = new TimelineSemaphore{
         .state = device,
     };
-    require_vk(vkCreateSemaphore(device->device, &create_info, nullptr, &result->semaphore));
+    if (error_from_vk(vkCreateSemaphore(device->device, &create_info, nullptr, &result->semaphore), "vkCreateSemaphore (timeline)") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2126,14 +2185,15 @@ void wait_timeline(TimelinePoint point) noexcept
         semaphore->state->device,
         &wait_info,
         ~uint64{0}));
-    semaphore->state->poll_command_retirement();
 }
 
-void write_timestamp(CommandBuffer* commands, uint64* gpu_destination, Stage stage) noexcept
+void write_timestamp(CommandBuffer* commands, uint64* cpu_destination, Stage stage) noexcept
 {
     assert(commands && commands->state);
+    if (!commands->timestamp_pool) return;
     assert(commands->timestamp_count < commands->state->timestamp_query_count);
-    commands->timestamp_destinations[commands->timestamp_count] = static_cast<VkDeviceAddress>(reinterpret_cast<uintptr>(gpu_destination));
+    assert(cpu_destination);
+    commands->timestamp_destinations[commands->timestamp_count] = cpu_destination;
     vkCmdWriteTimestamp2(commands->command_buffer, to_vk(stage), commands->timestamp_pool, commands->timestamp_count++);
 }
 
@@ -2147,6 +2207,7 @@ void destroy_gpu_heap(const GpuHeap& heap) noexcept
 {
     if (!heap.owner) return;
     assert(heap.owner->state);
+    if (heap.owner->record) heap.owner->state->buffer_map->remove(heap.owner->record);
     const VkDevice device = heap.owner->state->device;
     const detail::BackingBuffer& backing = heap.owner->backing;
     if (backing.mapped) vkUnmapMemory(device, backing.memory);
@@ -2223,9 +2284,7 @@ void destroy_owned_swapchain(Device& device) noexcept
     if (!device.swapchain)
         return;
     Swapchain* swapchain = device.swapchain;
-    assert((swapchain->state == &device && !swapchain->acquired &&
-                       device.acquired_swapchain != swapchain &&
-                       device.active_command_buffers == 0) && "device-owned swapchain destroyed while its image or command buffer is active");
+    assert(!swapchain->acquired && device.acquired_swapchain != swapchain);
     retire_swapchain_handle(*swapchain);
     swapchain->state = nullptr;
     delete swapchain;
@@ -2245,8 +2304,7 @@ VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR supp
         if ((supported & choice) != 0)
             return choice;
     }
-    assert(false && "surface exposes no composite alpha mode");
-    abort();
+    return static_cast<VkCompositeAlphaFlagBitsKHR>(0);
 }
 
 // Wayland-style surfaces report a client-driven size through currentExtent
@@ -2278,8 +2336,9 @@ VkExtent2D current_surface_extent(const Device& device, const VkSurfaceCapabilit
 [[nodiscard]] bool swapchain_surface_configuration_changed(const Swapchain& swapchain) noexcept
 {
     VkSurfaceCapabilitiesKHR capabilities{};
-    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(swapchain.state->physical_device, swapchain.state->surface, &capabilities));
-    require_error(error);
+    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(swapchain.state->physical_device, swapchain.state->surface, &capabilities),
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    require_error(error, "Display surface query");
 
     const VkExtent2D extent = current_surface_extent(*swapchain.state, capabilities);
     return extent.width != swapchain.width ||
@@ -2291,7 +2350,7 @@ VkExtent2D current_surface_extent(const Device& device, const VkSurfaceCapabilit
 Error recreate_swapchain(Swapchain& swapchain) noexcept
 {
     Device& device = *swapchain.state;
-    assert(!swapchain.acquired && !device.acquired_swapchain && device.active_command_buffers == 0);
+    assert(!swapchain.acquired && !device.acquired_swapchain);
     const VkSurfacePresentModeKHR present_mode_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
         .presentMode = swapchain_present_mode,
@@ -2304,19 +2363,13 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     VkSurfaceCapabilities2KHR capabilities_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
     };
-    Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilities2KHR(device.physical_device, &surface_info, &capabilities_info));
+    Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilities2KHR(device.physical_device, &surface_info, &capabilities_info),
+        "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
     if (error != Error::none)
         return error;
     const VkSurfaceCapabilitiesKHR& capabilities = capabilities_info.surfaceCapabilities;
 
     const VkExtent2D extent = current_surface_extent(device, capabilities);
-    if (extent.width == 0 || extent.height == 0)
-    {
-        swapchain.width = 0;
-        swapchain.height = 0;
-        swapchain.recreate_required = true;
-        return Error::none;
-    }
     if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0)
     {
         return Error::unsupported;
@@ -2324,12 +2377,14 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
 
     VkSurfaceFormatKHR formats[max_surface_formats]{};
     uint32 surface_format_count = 0;
-    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, nullptr));
+    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, nullptr),
+        "vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (error != Error::none)
         return error;
     if (surface_format_count == 0 || surface_format_count > max_surface_formats)
         return Error::unsupported;
-    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, formats));
+    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, formats),
+        "vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (error != Error::none)
         return error;
 
@@ -2339,7 +2394,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     {
         if ((formats[index].format == requested_format ||
              formats[index].format == VK_FORMAT_UNDEFINED) &&
-            formats[index].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            formats[index].colorSpace == swapchain.color_space)
         {
             format_supported = true;
             break;
@@ -2348,12 +2403,25 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     if (!format_supported)
         return Error::unsupported;
 
+    if (extent.width == 0 || extent.height == 0)
+    {
+        swapchain.width = 0;
+        swapchain.height = 0;
+        swapchain.recreate_required = true;
+        return Error::none;
+    }
+
     uint32 requested_image_count = device.present_context_count;
     if (requested_image_count < capabilities.minImageCount) requested_image_count = capabilities.minImageCount;
     if (capabilities.maxImageCount != 0 && requested_image_count > capabilities.maxImageCount) requested_image_count = capabilities.maxImageCount;
     if (requested_image_count == 0 || requested_image_count > max_swapchain_images) return Error::unsupported;
 
     const VkCompositeAlphaFlagBitsKHR composite_alpha = choose_composite_alpha(capabilities.supportedCompositeAlpha);
+    if (!composite_alpha)
+    {
+        if (error_callback) error_callback("The display surface exposes no supported composite alpha mode.", false);
+        return Error::unsupported;
+    }
     const VkSwapchainKHR old_handle = swapchain.handle;
     const VkSwapchainPresentModesCreateInfoKHR present_modes_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
@@ -2366,11 +2434,13 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .surface = device.surface,
         .minImageCount = requested_image_count,
         .imageFormat = requested_format,
-        .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        .imageColorSpace = swapchain.color_space,
         .imageExtent = extent,
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .imageSharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = composite_alpha,
         .presentMode = swapchain_present_mode,
@@ -2378,7 +2448,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .oldSwapchain = old_handle,
     };
     VkSwapchainKHR new_handle = VK_NULL_HANDLE;
-    error = error_from_vk(vkCreateSwapchainKHR(device.device, &create_info, nullptr, &new_handle));
+    error = error_from_vk(vkCreateSwapchainKHR(device.device, &create_info, nullptr, &new_handle), "vkCreateSwapchainKHR");
     if (error != Error::none)
     {
         retire_swapchain_handle(swapchain);
@@ -2392,14 +2462,14 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     {
         vkDestroySwapchainKHR(device.device, new_handle, nullptr);
         retire_swapchain_handle(swapchain);
-        return result == VK_SUCCESS ? Error::unsupported : error_from_vk(result);
+        return result == VK_SUCCESS ? Error::unsupported : error_from_vk(result, "vkGetSwapchainImagesKHR");
     }
     result = vkGetSwapchainImagesKHR(device.device, new_handle, &image_count, images);
     if (result != VK_SUCCESS)
     {
         vkDestroySwapchainKHR(device.device, new_handle, nullptr);
         retire_swapchain_handle(swapchain);
-        return error_from_vk(result);
+        return error_from_vk(result, "vkGetSwapchainImagesKHR");
     }
 
     VkImageView views[max_swapchain_images]{};
@@ -2425,7 +2495,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
             }
             vkDestroySwapchainKHR(device.device, new_handle, nullptr);
             retire_swapchain_handle(swapchain);
-            return error_from_vk(result);
+            return error_from_vk(result, "vkCreateImageView (swapchain)");
         }
     }
 
@@ -2453,18 +2523,45 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
 
 } // namespace
 
+Error set_swapchain_format(Device* device, Format format, ColorSpace color_space) noexcept
+{
+    assert(device && !device->acquired_swapchain);
+    if (!device->swapchain || (color_space != ColorSpace::srgb && !device->swapchain_color_space_enabled))
+        return Error::unsupported;
+
+    Swapchain& swapchain = *device->swapchain;
+    const VkColorSpaceKHR requested_color_space = color_space == ColorSpace::extended_srgb_linear
+        ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    if (swapchain.format == format && swapchain.color_space == requested_color_space)
+        return Error::none;
+
+    const Format old_format = swapchain.format;
+    const VkColorSpaceKHR old_color_space = swapchain.color_space;
+    swapchain.format = format;
+    swapchain.color_space = requested_color_space;
+    const Error error = recreate_swapchain(swapchain);
+    if (error != Error::none)
+    {
+        swapchain.format = old_format;
+        swapchain.color_space = old_color_space;
+        // vkCreateSwapchainKHR retires oldSwapchain even when creation fails.
+        if (!swapchain.handle)
+            require_error(recreate_swapchain(swapchain), "Swapchain recreation");
+    }
+    return error;
+}
+
 uint32x2 get_drawable_extent(Device* device) noexcept
 {
     assert(device && "get_drawable_extent called with a null device");
-    assert(device->active_command_buffers == 0 &&
-           !device->acquired_swapchain &&
-           "get_drawable_extent must be called outside command recording and presentation");
+    assert(!device->acquired_swapchain && "get_drawable_extent must be called outside presentation");
     if (!device->swapchain)
         return {};
 
     VkSurfaceCapabilitiesKHR capabilities{};
-    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physical_device, device->surface, &capabilities));
-    require_error(error);
+    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physical_device, device->surface, &capabilities),
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    if (error != Error::none) return {};
     const VkExtent2D extent = current_surface_extent(*device, capabilities);
 
     Swapchain& swapchain = *device->swapchain;
@@ -2478,13 +2575,12 @@ uint32x2 get_drawable_extent(Device* device) noexcept
     };
 }
 
-SwapchainFrame acquire(Device* device) noexcept
+SwapchainFrame acquire(CommandBuffer* commands) noexcept
 {
-    assert((device && device->swapchain &&
-                       device->swapchain->state == device &&
-                       !device->swapchain->acquired &&
-                       !device->acquired_swapchain &&
-                       device->active_command_buffers == 0) && "acquire received a device without an available swapchain");
+    assert(commands && commands->state && !commands->swapchain);
+    Device* device = commands->state;
+    assert(device->swapchain && !device->swapchain->acquired && !device->acquired_swapchain);
+    device->poll_presentation_retirement();
 
     Swapchain* swapchain = device->swapchain;
     detail::PresentContext* present_context = nullptr;
@@ -2494,7 +2590,7 @@ SwapchainFrame acquire(Device* device) noexcept
         if (!swapchain->handle || swapchain->recreate_required)
         {
             const Error error = recreate_swapchain(*swapchain);
-            require_error(error);
+            require_error(error, "Swapchain recreation");
             const bool drawable = swapchain->handle && swapchain->width != 0 && swapchain->height != 0;
             if (!drawable)
                 return {};
@@ -2521,7 +2617,7 @@ SwapchainFrame acquire(Device* device) noexcept
             continue;
         }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
-            abort_vk_failure(result);
+            abort_vk_failure(result, "vkAcquireNextImageKHR");
         assert((image_index < swapchain->image_count) && "swapchain returned an invalid image index");
 
         swapchain->image_index = image_index;
@@ -2529,6 +2625,25 @@ SwapchainFrame acquire(Device* device) noexcept
         swapchain->acquired = true;
         swapchain->recreate_required = result == VK_SUBOPTIMAL_KHR && swapchain_surface_configuration_changed(*swapchain);
         device->acquired_swapchain = swapchain;
+        const VkImageMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .oldLayout = swapchain->initialized[image_index] ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = swapchain->images[image_index],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+        record_image_barriers(commands->command_buffer, {&barrier, 1});
+        commands->swapchain = swapchain;
+        swapchain->transition_commands = commands;
         return {
             .render_view = &swapchain->render_views[image_index],
             .extent = {.x = swapchain->width, .y = swapchain->height},
@@ -2606,7 +2721,9 @@ void prepare_texture(Device& device, const TextureDesc& desc, PreparedTexture& o
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 }
@@ -2624,7 +2741,11 @@ TextureHeap create_texture_heap(Device* device, uint64 byte_count) noexcept
         .allocationSize = byte_count,
         .memoryTypeIndex = device->texture_memory_type,
     };
-    require_vk(vkAllocateMemory(device->device, &allocate_info, nullptr, &owner->memory));
+    if (error_from_vk(vkAllocateMemory(device->device, &allocate_info, nullptr, &owner->memory), "vkAllocateMemory (texture heap)", byte_count) != Error::none)
+    {
+        delete owner;
+        return {};
+    }
     return {
         .size = byte_count,
         .owner = owner,
@@ -2643,6 +2764,11 @@ SizeAlign get_texture_size_align(Device* device, const TextureDesc& desc) noexce
     assert(device && "get_texture_size_align called with a null device");
     PreparedTexture texture{};
     prepare_texture(*device, desc, texture);
+    if (!supports_image_create_info(*device, texture.image_info))
+    {
+        if (error_callback) error_callback("The GPU cannot create the requested texture format, usage, or extent.", false);
+        return {};
+    }
     const VkMemoryRequirements requirements = image_memory_requirements(*device, texture.image_info);
     return {
         .size = requirements.size,
@@ -2652,9 +2778,7 @@ SizeAlign get_texture_size_align(Device* device, const TextureDesc& desc) noexce
 
 Texture* create_texture(Device* device, const TextureDesc& desc, const TextureHeap& heap, uint64 offset) noexcept
 {
-    const TextureHeapOwner* owner = heap.owner;
-    assert(device && owner && owner->state == device && owner->memory && "create_texture requires a texture heap from the same device");
-    assert(device->active_command_buffers == 0 && "create_texture is not allowed while a command buffer is recording");
+    assert(device && heap.owner && heap.owner->state == device);
     PreparedTexture texture{};
     prepare_texture(*device, desc, texture);
 
@@ -2667,22 +2791,46 @@ Texture* create_texture(Device* device, const TextureDesc& desc, const TextureHe
         .type = desc.type,
         .format = desc.format,
     };
-    require_vk(vkCreateImage(device->device, &texture.image_info, nullptr, &result->image));
-    require_vk(vkBindImageMemory(device->device, result->image, owner->memory, offset));
-
-    result->initialization = {
-        .image = result->image,
-        .aspect_mask = image_aspects(desc.format),
-        .mip_levels = desc.mip_levels,
-        .array_layers = desc.layer_count,
-    };
-    detail::append_texture_initialization(device->pending_texture_initializations, result->initialization);
+    if (error_from_vk(vkCreateImage(device->device, &texture.image_info, nullptr, &result->image), "vkCreateImage") != Error::none)
+    {
+        result->image = VK_NULL_HANDLE;
+        delete result;
+        return nullptr;
+    }
+    if (error_from_vk(vkBindImageMemory(device->device, result->image, heap.owner->memory, offset), "vkBindImageMemory") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
 void destroy_texture(Texture* texture) noexcept
 {
     delete texture;
+}
+
+void initialize_texture(CommandBuffer* commands, Texture* texture) noexcept
+{
+    assert(commands && texture && commands->state == texture->state);
+    const VkImageMemoryBarrier2 image_barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        // Join the caller's dependency without making unrelated image writes available again.
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = texture->image,
+        .subresourceRange = {
+            .aspectMask = image_aspects(texture->format),
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    record_image_barriers(commands->command_buffer, {&image_barrier, 1});
 }
 
 RenderView* create_render_view(Texture* texture, const RenderViewDesc& desc) noexcept
@@ -2711,7 +2859,11 @@ RenderView* create_render_view(Texture* texture, const RenderViewDesc& desc) noe
             .layerCount = 1,
         },
     };
-    require_vk(vkCreateImageView(texture->state->device, &view_info, nullptr, &result->view));
+    if (error_from_vk(vkCreateImageView(texture->state->device, &view_info, nullptr, &result->view), "vkCreateImageView") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2723,10 +2875,89 @@ void destroy_render_view(RenderView* render_view) noexcept
     delete render_view;
 }
 
-void write_texture_descriptor(Device* device, void* cpu_destination, const Texture* texture, TextureDescriptorType type,
+TextureDescriptorHeap* create_texture_descriptor_heap(Device* device, uint32 capacity) noexcept
+{
+    assert(device && capacity);
+    TextureDescriptorHeap* heap = new TextureDescriptorHeap{
+        .state = device,
+        .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.imageDescriptorSize, DescriptorHeapType::texture),
+        .capacity = capacity,
+    };
+    if (!heap->storage.owner)
+    {
+        delete heap;
+        return nullptr;
+    }
+    heap->descriptors = new byte[uint64(capacity) * device->heap_properties.imageDescriptorSize];
+    return heap;
+}
+
+void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept
+{
+    if (!heap) return;
+    destroy_gpu_heap(heap->storage);
+    delete[] heap->descriptors;
+    delete heap;
+}
+
+SamplerDescriptorHeap* create_sampler_descriptor_heap(Device* device, uint32 capacity) noexcept
+{
+    assert(device && capacity);
+    SamplerDescriptorHeap* heap = new SamplerDescriptorHeap{
+        .state = device,
+        .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.samplerDescriptorSize, DescriptorHeapType::sampler),
+        .capacity = capacity,
+    };
+    if (!heap->storage.owner)
+    {
+        delete heap;
+        return nullptr;
+    }
+    heap->descriptors = new byte[uint64(capacity) * device->heap_properties.samplerDescriptorSize];
+    return heap;
+}
+
+void destroy_sampler_descriptor_heap(SamplerDescriptorHeap* heap) noexcept
+{
+    if (!heap) return;
+    destroy_gpu_heap(heap->storage);
+    delete[] heap->descriptors;
+    delete heap;
+}
+
+void copy_texture_descriptors(const TextureDescriptorHeap* source, uint32 source_index, TextureDescriptorHeap* destination,
+                              uint32 destination_index, uint32 count) noexcept
+{
+    assert(source && destination && source->state == destination->state);
+    assert(source_index <= source->capacity && count <= source->capacity - source_index);
+    assert(destination_index <= destination->capacity && count <= destination->capacity - destination_index);
+    if (!count || (source == destination && source_index == destination_index)) return;
+    const uint64 stride = source->state->heap_properties.imageDescriptorSize;
+    memmove(destination->descriptors + uint64(destination_index) * stride,
+            source->descriptors + uint64(source_index) * stride, size_t(count * stride));
+    memcpy(destination->storage.range.cpu + uint64(destination_index) * stride,
+           destination->descriptors + uint64(destination_index) * stride, size_t(count * stride));
+}
+
+void copy_sampler_descriptors(const SamplerDescriptorHeap* source, uint32 source_index, SamplerDescriptorHeap* destination,
+                              uint32 destination_index, uint32 count) noexcept
+{
+    assert(source && destination && source->state == destination->state);
+    assert(source_index <= source->capacity && count <= source->capacity - source_index);
+    assert(destination_index <= destination->capacity && count <= destination->capacity - destination_index);
+    if (!count || (source == destination && source_index == destination_index)) return;
+    const uint64 stride = source->state->heap_properties.samplerDescriptorSize;
+    memmove(destination->descriptors + uint64(destination_index) * stride,
+            source->descriptors + uint64(source_index) * stride, size_t(count * stride));
+    memcpy(destination->storage.range.cpu + uint64(destination_index) * stride,
+           destination->descriptors + uint64(destination_index) * stride, size_t(count * stride));
+}
+
+void write_texture_descriptor(TextureDescriptorHeap* heap, uint32 index, const Texture* texture, TextureDescriptorType type,
                               const TextureDescriptorDesc& desc) noexcept
 {
-    assert(device && texture);
+    assert(heap && texture && index < heap->capacity && heap->state == texture->state);
+    Device* device = heap->state;
 
     const VkImageUsageFlags descriptor_usage = static_cast<VkImageUsageFlags>(
         type == TextureDescriptorType::sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT);
@@ -2773,15 +3004,17 @@ void write_texture_descriptor(Device* device, void* cpu_destination, const Textu
         .data = {.pImage = &image_descriptor},
     };
     const VkHostAddressRangeEXT destination{
-        .address = cpu_destination,
+        .address = heap->descriptors + uint64(index) * device->heap_properties.imageDescriptorSize,
         .size = static_cast<size_t>(device->heap_properties.imageDescriptorSize),
     };
     assert_vk(device->fn.write_resource_descriptors(device->device, 1, &descriptor_info, &destination));
+    memcpy(heap->storage.range.cpu + uint64(index) * device->heap_properties.imageDescriptorSize, destination.address, destination.size);
 }
 
-void write_sampler_descriptor(Device* device, void* cpu_destination, const SamplerDesc& desc) noexcept
+void write_sampler_descriptor(SamplerDescriptorHeap* heap, uint32 index, const SamplerDesc& desc) noexcept
 {
-    assert(device);
+    assert(heap && index < heap->capacity);
+    Device* device = heap->state;
     const VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = static_cast<VkFilter>(desc.mag_filter),
@@ -2797,44 +3030,83 @@ void write_sampler_descriptor(Device* device, void* cpu_destination, const Sampl
         .maxLod = VK_LOD_CLAMP_NONE,
     };
     const VkHostAddressRangeEXT destination{
-        .address = cpu_destination,
+        .address = heap->descriptors + uint64(index) * device->heap_properties.samplerDescriptorSize,
         .size = static_cast<size_t>(device->heap_properties.samplerDescriptorSize),
     };
     assert_vk(device->fn.write_sampler_descriptors(device->device, 1, &sampler_info, &destination));
+    memcpy(heap->storage.range.cpu + uint64(index) * device->heap_properties.samplerDescriptorSize, destination.address, destination.size);
 }
 
 namespace
 {
 
-PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Span<const uint32> fragment_spirv, Span<const ColorTargetDesc> color_targets,
-                       Format depth_format, Format stencil_format, const RasterizationState& rasterization_state, bool mesh) noexcept
+void assert_spirv(ByteSpan code) noexcept
+{
+    assert(code.data && code.size >= 5 * sizeof(uint32) && code.size % sizeof(uint32) == 0 &&
+           reinterpret_cast<uintptr>(code.data) % alignof(uint32) == 0 && "PSO stages require aligned SPIR-V binaries");
+    assert(*reinterpret_cast<const uint32*>(code.data) == 0x07230203u && "PSO stage does not contain SPIR-V");
+}
+
+constexpr VkDescriptorSetAndBindingMappingEXT root_mapping{
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT,
+    .bindingCount = 1,
+    .resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT | VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT,
+    .source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT,
+    .sourceData = {.pushAddressOffset = 0},
+};
+
+PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const ShaderStage& fragment, Span<const ColorTargetDesc> color_targets,
+                       Format depth_format, Format stencil_format, const RasterizationState& rasterization_state,
+                       bool mesh, const ShaderStage& task = {}) noexcept
 {
     assert(device && "PSO creation called with a null device");
+    assert_spirv(first_stage.code);
+    if (task.code.size) assert_spirv(task.code);
+    if (fragment.code.size) assert_spirv(fragment.code);
     assert((color_targets.size == 0 || color_targets.data) && color_targets.size <= max_color_attachments &&
            "color targets must fit the wrapper's attachment array");
 
+    const VkShaderModuleCreateInfo task_module_info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = task.code.size,
+        .pCode = reinterpret_cast<const uint32*>(task.code.data),
+    };
     const VkShaderModuleCreateInfo first_stage_module_info{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = first_stage_spirv.size * sizeof(uint32),
-        .pCode = first_stage_spirv.data,
+        .codeSize = first_stage.code.size,
+        .pCode = reinterpret_cast<const uint32*>(first_stage.code.data),
     };
     const VkShaderModuleCreateInfo fragment_module_info{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = fragment_spirv.size * sizeof(uint32),
-        .pCode = fragment_spirv.data,
+        .codeSize = fragment.code.size,
+        .pCode = reinterpret_cast<const uint32*>(fragment.code.data),
+    };
+    const VkShaderDescriptorSetAndBindingMappingInfoEXT mappings[]{
+        {.sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, .pNext = &task_module_info,
+         .mappingCount = 1, .pMappings = &root_mapping},
+        {.sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, .pNext = &first_stage_module_info,
+         .mappingCount = 1, .pMappings = &root_mapping},
+        {.sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, .pNext = &fragment_module_info,
+         .mappingCount = 1, .pMappings = &root_mapping},
     };
     const VkPipelineShaderStageCreateInfo stages[]{
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &first_stage_module_info,
-            .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
-            .pName = mesh ? "meshMain" : "vertexMain",
+            .pNext = &mappings[0],
+            .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+            .pName = task.entry_point,
         },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &fragment_module_info,
+            .pNext = &mappings[1],
+            .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
+            .pName = first_stage.entry_point,
+        },
+        VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = &mappings[2],
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .pName = "fragmentMain",
+            .pName = fragment.entry_point,
         },
     };
     const VkPipelineVertexInputStateCreateInfo vertex_input{
@@ -2924,8 +3196,8 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
     const VkGraphicsPipelineCreateInfo pso_info{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &flags_info,
-        .stageCount = fragment_spirv.size ? 2u : 1u,
-        .pStages = stages,
+        .stageCount = 1u + (task.code.size ? 1u : 0u) + (fragment.code.size ? 1u : 0u),
+        .pStages = stages + (task.code.size ? 0u : 1u),
         .pVertexInputState = mesh ? nullptr : &vertex_input,
         .pInputAssemblyState = mesh ? nullptr : &input_assembly,
         .pViewportState = &viewport_state,
@@ -2940,7 +3212,11 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
     };
-    require_vk(vkCreateGraphicsPipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso));
+    if (error_from_vk(vkCreateGraphicsPipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateGraphicsPipelines") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2948,30 +3224,37 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
 
 PSO* create_graphics_pso(Device* device, const GraphicsPSODesc& desc) noexcept
 {
-    return create_raster_pso(device, desc.vertex_spirv, desc.fragment_spirv, desc.color_targets, desc.depth_format,
+    return create_raster_pso(device, desc.vertex, desc.fragment, desc.color_targets, desc.depth_format,
                              desc.stencil_format, desc.rasterization, false);
 }
 
 PSO* create_mesh_pso(Device* device, const MeshPSODesc& desc) noexcept
 {
-    return create_raster_pso(device, desc.mesh_spirv, desc.fragment_spirv, desc.color_targets, desc.depth_format,
-                             desc.stencil_format, desc.rasterization, true);
+    return create_raster_pso(device, desc.mesh, desc.fragment, desc.color_targets, desc.depth_format,
+                             desc.stencil_format, desc.rasterization, true, desc.task);
 }
 
-PSO* create_compute_pso(Device* device, Span<const uint32> compute_spirv) noexcept
+PSO* create_compute_pso(Device* device, const ShaderStage& compute) noexcept
 {
     assert(device && "create_compute_pso called with a null device");
+    assert_spirv(compute.code);
 
     const VkShaderModuleCreateInfo module_info{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = compute_spirv.size * sizeof(uint32),
-        .pCode = compute_spirv.data,
+        .codeSize = compute.code.size,
+        .pCode = reinterpret_cast<const uint32*>(compute.code.data),
+    };
+    const VkShaderDescriptorSetAndBindingMappingInfoEXT mapping{
+        .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+        .pNext = &module_info,
+        .mappingCount = 1,
+        .pMappings = &root_mapping,
     };
     const VkPipelineShaderStageCreateInfo stage{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = &module_info,
+        .pNext = &mapping,
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .pName = "computeMain",
+        .pName = compute.entry_point,
     };
     const VkPipelineCreateFlags2CreateInfo flags_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
@@ -2987,7 +3270,11 @@ PSO* create_compute_pso(Device* device, Span<const uint32> compute_spirv) noexce
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_COMPUTE,
     };
-    require_vk(vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso));
+    if (error_from_vk(vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateComputePipelines") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2996,64 +3283,158 @@ void destroy_pso(PSO* pso) noexcept
     delete pso;
 }
 
-CommandBuffer* begin_commands(Device* device) noexcept
+CommandPool* create_command_pool(Device* device, uint32 queue_index) noexcept
 {
-    assert(device && "begin_commands called with a null device");
-    CommandBuffer* result = &device->acquire_command_context();
+    assert(device && queue_index < device->queue_count && "create_command_pool requires an available queue index");
+    CommandPool* pool = new CommandPool{.state = device, .timestamps = device->queues[queue_index].timestamps};
+    const VkCommandPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = device->queues[queue_index].family_index,
+    };
+    if (error_from_vk(vkCreateCommandPool(device->device, &pool_info, nullptr, &pool->command_pool), "vkCreateCommandPool") != Error::none)
+    {
+        delete pool;
+        return nullptr;
+    }
+    return pool;
+}
+
+void destroy_command_pool(CommandPool* pool) noexcept
+{
+    if (!pool) return;
+    while (pool->first)
+    {
+        CommandBuffer* commands = pool->first;
+        assert(!commands->swapchain && "an acquired swapchain image must be presented before destroying its command pool");
+        pool->first = commands->next;
+        if (commands->timestamp_pool) vkDestroyQueryPool(pool->state->device, commands->timestamp_pool, nullptr);
+        free(commands->timestamp_destinations);
+        free(commands->timestamp_results);
+        delete commands;
+    }
+    vkDestroyCommandPool(pool->state->device, pool->command_pool, nullptr);
+    delete pool;
+}
+
+void reset_command_pool(CommandPool* pool) noexcept
+{
+    assert(pool && pool->state && pool->command_pool);
+    for (CommandBuffer* commands = pool->first; commands; commands = commands->next)
+    {
+        assert(!commands->swapchain && "an acquired swapchain image must be presented before resetting its command pool");
+        commands->submitted = false;
+        commands->timestamp_count = 0;
+    }
+    assert_vk(vkResetCommandPool(pool->state->device, pool->command_pool, 0));
+    pool->next_buffer = pool->first;
+}
+
+void read_timestamps(CommandPool* pool) noexcept
+{
+    assert(pool && pool->state);
+    for (CommandBuffer* commands = pool->first; commands; commands = commands->next)
+    {
+        if (!commands->submitted || commands->timestamp_count == 0) continue;
+        assert_vk(vkGetQueryPoolResults(pool->state->device, commands->timestamp_pool, 0, commands->timestamp_count,
+                                       sizeof(uint64) * commands->timestamp_count, commands->timestamp_results, sizeof(uint64), VK_QUERY_RESULT_64_BIT));
+        for (uint32 index = 0; index < commands->timestamp_count; ++index)
+            *commands->timestamp_destinations[index] = commands->timestamp_results[index];
+        commands->timestamp_count = 0;
+    }
+}
+
+CommandBuffer* begin_commands(CommandPool* pool) noexcept
+{
+    assert(pool && pool->state && pool->command_pool);
+    CommandBuffer* commands = pool->next_buffer;
+    if (commands)
+    {
+        pool->next_buffer = commands->next;
+    }
+    else
+    {
+        commands = new CommandBuffer{.state = pool->state, .command_pool = pool->command_pool};
+        const VkCommandBufferAllocateInfo allocate_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool->command_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        if (error_from_vk(vkAllocateCommandBuffers(pool->state->device, &allocate_info, &commands->command_buffer), "vkAllocateCommandBuffers") != Error::none)
+        {
+            delete commands;
+            return nullptr;
+        }
+        if (pool->timestamps)
+        {
+            const VkQueryPoolCreateInfo query_info{
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = pool->state->timestamp_query_count,
+            };
+            if (error_from_vk(vkCreateQueryPool(pool->state->device, &query_info, nullptr, &commands->timestamp_pool), "vkCreateQueryPool") != Error::none)
+            {
+                vkFreeCommandBuffers(pool->state->device, pool->command_pool, 1, &commands->command_buffer);
+                delete commands;
+                return nullptr;
+            }
+            commands->timestamp_destinations = static_cast<uint64**>(malloc(sizeof(uint64*) * pool->state->timestamp_query_count));
+            commands->timestamp_results = static_cast<uint64*>(malloc(sizeof(uint64) * pool->state->timestamp_query_count));
+        }
+        if (pool->last)
+            pool->last->next = commands;
+        else
+            pool->first = commands;
+        pool->last = commands;
+    }
+    assert(!commands->swapchain);
     const VkCommandBufferBeginInfo begin_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    assert_vk(vkBeginCommandBuffer(result->command_buffer, &begin_info));
-    result->state = device;
-    result->timestamp_count = 0;
-    if (result->timestamp_pool)
-        vkCmdResetQueryPool(result->command_buffer, result->timestamp_pool, 0, device->timestamp_query_count);
-    if (device->pending_texture_initializations.first)
+    assert_vk(vkBeginCommandBuffer(commands->command_buffer, &begin_info));
+    commands->timestamp_count = 0;
+    commands->submitted = false;
+    commands->has_epilogue = false;
+    if (commands->timestamp_pool)
+        vkResetQueryPool(pool->state->device, commands->timestamp_pool, 0, pool->state->timestamp_query_count);
+    return commands;
+}
+
+void end_commands(CommandBuffer* commands) noexcept
+{
+    assert(commands);
+    VkCommandBuffer command_buffer = commands->command_buffer;
+    if (commands->swapchain)
     {
-        VkImageMemoryBarrier2 barriers[image_barrier_batch_size]{};
-        uint32 barrier_count = 0;
-        while (device->pending_texture_initializations.first)
+        assert_vk(vkEndCommandBuffer(command_buffer));
+        if (!commands->epilogue)
         {
-            detail::TextureInitialization* initialization = device->pending_texture_initializations.first;
-            detail::remove_texture_initialization(*initialization);
-            barriers[barrier_count++] = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = initialization->image,
-                .subresourceRange = {
-                    .aspectMask = initialization->aspect_mask,
-                    .levelCount = initialization->mip_levels,
-                    .layerCount = initialization->array_layers,
-                },
+            const VkCommandBufferAllocateInfo allocate_info{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool = commands->command_pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1,
             };
-            if (barrier_count == image_barrier_batch_size)
-            {
-                record_image_barriers(result->command_buffer, {barriers, barrier_count});
-                barrier_count = 0;
-            }
+            require_vk(vkAllocateCommandBuffers(commands->state->device, &allocate_info, &commands->epilogue), "vkAllocateCommandBuffers (epilogue)");
         }
-        if (barrier_count != 0) record_image_barriers(result->command_buffer, {barriers, barrier_count});
-    }
-    if (device->acquired_swapchain && !device->acquired_swapchain->transition_commands)
-    {
-        Swapchain* swapchain = device->acquired_swapchain;
-        assert((swapchain->state == device && swapchain->acquired &&
-                           swapchain->present_context &&
-                           swapchain->image_index < swapchain->image_count) && "the acquired swapchain state is invalid");
+        const VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        command_buffer = commands->epilogue;
+        assert_vk(vkBeginCommandBuffer(command_buffer, &begin_info));
+        commands->has_epilogue = true;
+        Swapchain* swapchain = commands->swapchain;
+        assert(swapchain->acquired && swapchain->transition_commands == commands);
         const VkImageMemoryBarrier2 barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .oldLayout = swapchain->initialized[swapchain->image_index] ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = swapchain->images[swapchain->image_index],
@@ -3063,170 +3444,154 @@ CommandBuffer* begin_commands(Device* device) noexcept
                 .layerCount = 1,
             },
         };
-        record_image_barriers(result->command_buffer, {&barrier, 1});
-        result->swapchain = swapchain;
-        swapchain->transition_commands = result;
+        record_image_barriers(command_buffer, {&barrier, 1});
     }
-    ++device->active_command_buffers;
-    return result;
+    assert_vk(vkEndCommandBuffer(command_buffer));
 }
 
 namespace
 {
 
-void submit_commands(Span<CommandBuffer* const> commands, Device* device, TimelinePoint completion, VkSemaphore wait_semaphore,
-                     VkSemaphore signal_semaphore) noexcept
+void submit_commands(Device* device, const SubmitDesc& desc, uint32 queue_index, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore) noexcept
 {
-    TimelineSemaphore* completion_semaphore = completion.semaphore;
-    assert((completion_semaphore &&
-                                  completion_semaphore->state == device &&
-                                  completion_semaphore->semaphore) && "submission completion requires a live timeline semaphore owned by the device");
-    assert(commands.data && commands.size != 0 && commands.size <= UINT_MAX);
-    assert(device->active_command_buffers == commands.size && "submit must consume every begun command buffer");
-    assert(!device->pending_texture_initializations.first && !device->pending_texture_initializations.last && "pending texture transitions were not recorded");
-    assert(device->command_context_count >= commands.size);
-    for (size_t index = 0; index < commands.size; ++index)
+    detail::Queue* queue = &device->queues[queue_index];
+    TimelineSemaphore* completion = desc.completion.semaphore;
+    assert(completion);
+    assert(desc.waits.data || desc.waits.size == 0);
+    size_t command_count = desc.commands.size;
+    for (size_t index = 0; index < desc.commands.size; ++index)
     {
-        CommandBuffer* current = commands.data[index];
-        assert((current && current->state == device) && "command buffer batch contains an invalid handle");
-        for (uint32 timestamp = 0; timestamp < current->timestamp_count; ++timestamp)
-        {
-            const VkStridedDeviceAddressRangeKHR destination{
-                .address = current->timestamp_destinations[timestamp],
-                .size = sizeof(uint64),
-                .stride = sizeof(uint64),
-            };
-            device->fn.cmd_copy_query_pool_results_to_memory(current->command_buffer, current->timestamp_pool, timestamp, 1,
-                                                            &destination, address_flags, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        }
-        if (current->timestamp_count != 0)
-            barrier(current, Stage::transfer, Access::transfer_write, Stage::host, Access::host_read);
-        assert_vk(vkEndCommandBuffer(current->command_buffer));
-        current->state = nullptr;
-        assert(device->active_command_buffers != 0);
-        --device->active_command_buffers;
-        device->command_submit_infos[index] = {
+        assert(desc.commands.data[index]);
+        if (desc.commands.data[index]->has_epilogue) ++command_count;
+    }
+    if (command_count > queue->command_submit_capacity)
+    {
+        queue->command_submit_capacity = queue->command_submit_capacity == 0 ? 4 : queue->command_submit_capacity * 2;
+        if (queue->command_submit_capacity < command_count) queue->command_submit_capacity = command_count;
+        queue->command_submit_infos = static_cast<VkCommandBufferSubmitInfo*>(
+            realloc(queue->command_submit_infos, queue->command_submit_capacity * sizeof(VkCommandBufferSubmitInfo)));
+    }
+    for (size_t index = 0; index < desc.commands.size; ++index)
+    {
+        CommandBuffer* commands = desc.commands.data[index];
+        assert(commands);
+        queue->command_submit_infos[index] = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-            .commandBuffer = current->command_buffer,
+            .commandBuffer = commands->command_buffer,
             .deviceMask = 1,
         };
     }
-    assert(device->active_command_buffers == 0);
-    const uint64 retirement = device->next_command_retirement();
-    const VkSemaphoreSubmitInfo wait_info{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = wait_semaphore,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-    };
-    const VkSemaphoreSubmitInfo work_signal_infos[2]{
-      {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = completion_semaphore->semaphore,
-        .value = completion.value,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      },
-      {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = signal_semaphore,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      },
-    };
-    const VkSemaphoreSubmitInfo retirement_signal_info{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = device->command_retirement,
-        .value = retirement,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-    };
-    const VkSubmitInfo2 submit_infos[2]{
-      {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = wait_semaphore ? 1u : 0u,
-        .pWaitSemaphoreInfos = wait_semaphore ? &wait_info : nullptr,
-        .commandBufferInfoCount = static_cast<uint32>(commands.size),
-        .pCommandBufferInfos = device->command_submit_infos,
-        .signalSemaphoreInfoCount = signal_semaphore ? 2u : 1u,
-        .pSignalSemaphoreInfos = work_signal_infos,
-      },
-      {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .signalSemaphoreInfoCount = 1,
-        .pSignalSemaphoreInfos = &retirement_signal_info,
-      },
-    };
-    assert_vk(vkQueueSubmit2(device->queue, 2, submit_infos, VK_NULL_HANDLE));
-
-    for (size_t index = 0; index < commands.size; ++index)
+    // Presentation transitions must follow every suspended/resumed segment.
+    size_t epilogue_index = desc.commands.size;
+    for (size_t index = 0; index < desc.commands.size; ++index)
     {
-        CommandBuffer* current = commands.data[index];
-        current->retire_value = retirement;
-        current->swapchain = nullptr;
+        CommandBuffer* commands = desc.commands.data[index];
+        if (commands->has_epilogue)
+        {
+            queue->command_submit_infos[epilogue_index++] = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                .commandBuffer = commands->epilogue,
+                .deviceMask = 1,
+            };
+        }
     }
+    const size_t wait_count = desc.waits.size + (wait_semaphore ? 1 : 0);
+    if (wait_count > queue->wait_submit_capacity)
+    {
+        queue->wait_submit_capacity = queue->wait_submit_capacity == 0 ? 4 : queue->wait_submit_capacity * 2;
+        if (queue->wait_submit_capacity < wait_count) queue->wait_submit_capacity = wait_count;
+        queue->wait_submit_infos = static_cast<VkSemaphoreSubmitInfo*>(
+            realloc(queue->wait_submit_infos, queue->wait_submit_capacity * sizeof(VkSemaphoreSubmitInfo)));
+    }
+    for (size_t index = 0; index < desc.waits.size; ++index)
+    {
+        const TimelinePoint point = desc.waits.data[index];
+        assert(point.semaphore);
+        queue->wait_submit_infos[index] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = point.semaphore->semaphore,
+            .value = point.value,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+    }
+    if (wait_semaphore)
+    {
+        queue->wait_submit_infos[desc.waits.size] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = wait_semaphore,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+    }
+    VkSemaphoreSubmitInfo signal_infos[3]{
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = completion->semaphore,
+            .value = desc.completion.value,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        },
+    };
+    uint32 signal_count = 1;
+    if (signal_semaphore)
+    {
+        signal_infos[signal_count++] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = signal_semaphore,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+        signal_infos[signal_count++] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = device->presentation_retirement,
+            .value = device->next_presentation_retirement(),
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+    }
+    const VkSubmitInfo2 submit_info{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = static_cast<uint32>(wait_count),
+        .pWaitSemaphoreInfos = queue->wait_submit_infos,
+        .commandBufferInfoCount = static_cast<uint32>(command_count),
+        .pCommandBufferInfos = queue->command_submit_infos,
+        .signalSemaphoreInfoCount = signal_count,
+        .pSignalSemaphoreInfos = signal_infos,
+    };
+    assert_vk(vkQueueSubmit2(queue->queue, 1, &submit_info, VK_NULL_HANDLE));
+    for (size_t index = 0; index < desc.commands.size; ++index) desc.commands.data[index]->submitted = true;
 }
 
 } // namespace
 
-void submit(Span<CommandBuffer* const> commands, TimelinePoint completion) noexcept
+void submit(Device* device, const SubmitDesc& desc, uint32 queue_index) noexcept
 {
-    assert(commands.data && commands.size != 0);
-    CommandBuffer* first = commands.data[0];
-    assert(first && first->state);
-    Device* device = first->state;
-    assert(!device->acquired_swapchain && "an acquired swapchain frame must be submitted with submit_and_present");
+    assert(device && queue_index < device->queue_count && "submit requires an available queue index");
+    assert(desc.commands.data || desc.commands.size == 0);
 #if !defined(NDEBUG)
-    for (size_t index = 0; index < commands.size; ++index)
-    {
-        assert(!commands.data[index]->swapchain && "swapchain command buffers must be submitted with submit_and_present");
-    }
+    for (size_t index = 0; index < desc.commands.size; ++index)
+        assert(desc.commands.data[index] && !desc.commands.data[index]->swapchain && "swapchain commands require submit_and_present");
 #endif
-    submit_commands(commands, device, completion, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    submit_commands(device, desc, queue_index, VK_NULL_HANDLE, VK_NULL_HANDLE);
 }
 
-void submit_and_present(Device* device, Span<CommandBuffer* const> commands, TimelinePoint completion) noexcept
+void submit_and_present(Device* device, const SubmitDesc& desc) noexcept
 {
-    const bool has_swapchain = device && device->swapchain && device->swapchain->state == device;
-    assert(has_swapchain && "submit_and_present received a device without a swapchain");
+    assert(device);
+    assert(desc.commands.data || desc.commands.size == 0);
     Swapchain* swapchain = device->swapchain;
-    assert(commands.data && commands.size != 0);
-    CommandBuffer* first_commands = commands.data[0];
-    CommandBuffer* last_commands = commands.data[commands.size - 1];
-    assert(first_commands && first_commands->state &&
-           last_commands && last_commands->state == first_commands->state);
-    Device* command_device = first_commands->state;
-    assert((swapchain->acquired &&
-                       command_device == device &&
-                       first_commands->swapchain == swapchain &&
-                       swapchain->transition_commands == first_commands &&
-                       swapchain->present_context) && "submit_and_present received an invalid swapchain command buffer batch");
+    assert(swapchain && swapchain->acquired && swapchain->transition_commands && swapchain->present_context);
 #if !defined(NDEBUG)
-    for (size_t index = 1; index < commands.size; ++index)
+    bool contains_swapchain = false;
+    for (size_t index = 0; index < desc.commands.size; ++index)
     {
-        assert(!commands.data[index]->swapchain && "only the first command buffer may own the swapchain transition");
+        assert(desc.commands.data[index] && (!desc.commands.data[index]->swapchain || desc.commands.data[index] == swapchain->transition_commands));
+        if (desc.commands.data[index] == swapchain->transition_commands) contains_swapchain = true;
     }
+    assert(contains_swapchain && "presentation submission must include the acquired command buffer");
 #endif
-
-    Device& owner = *device;
     detail::PresentContext& present_context = *swapchain->present_context;
-    const VkImageMemoryBarrier2 barrier{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = swapchain->images[swapchain->image_index],
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
-    record_image_barriers(last_commands->command_buffer, {&barrier, 1});
     assert(!present_context.present_pending && !present_context.swapchain);
-    assert_vk(vkResetFences(owner.device, 1, &present_context.presented));
+    assert_vk(vkResetFences(device->device, 1, &present_context.presented));
+    submit_commands(device, desc, 0, present_context.acquired, present_context.rendered);
+    swapchain->transition_commands->swapchain = nullptr;
     swapchain->transition_commands = nullptr;
-    submit_commands(commands, command_device, completion, present_context.acquired, present_context.rendered);
     swapchain->initialized[swapchain->image_index] = true;
 
     const VkSwapchainPresentFenceInfoKHR fence_info{
@@ -3243,26 +3608,26 @@ void submit_and_present(Device* device, Span<CommandBuffer* const> commands, Tim
         .pSwapchains = &swapchain->handle,
         .pImageIndices = &swapchain->image_index,
     };
-    const VkResult result = vkQueuePresentKHR(owner.queue, &present_info);
+    const VkResult result = vkQueuePresentKHR(device->queues[0].queue, &present_info);
     present_context.present_pending = true;
     present_context.swapchain = swapchain->handle;
     swapchain->present_context = nullptr;
     swapchain->acquired = false;
-    owner.acquired_swapchain = nullptr;
-    owner.next_present_context = (owner.next_present_context + 1) % owner.present_context_count;
+    device->acquired_swapchain = nullptr;
+    device->next_present_context = (device->next_present_context + 1) % device->present_context_count;
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
         swapchain->recreate_required = true;
     else if (result == VK_SUBOPTIMAL_KHR)
         swapchain->recreate_required = swapchain->recreate_required || swapchain_surface_configuration_changed(*swapchain);
     else if (result != VK_SUCCESS)
-        abort_vk_failure(result);
+        abort_vk_failure(result, "vkQueuePresentKHR");
 }
 
 void wait_idle(Device* device) noexcept
 {
     assert(device && "wait_idle called with a null device");
-    assert(device->active_command_buffers == 0 && "wait_idle is not allowed while a command buffer is recording");
     assert(!device->acquired_swapchain && "wait_idle is not allowed while a swapchain image is acquired");
+    assert_vk(vkDeviceWaitIdle(device->device));
     device->drain_contexts();
     device->next_present_context = 0;
 }
@@ -3362,28 +3727,61 @@ VkDeviceMemoryImageCopyKHR make_texture_copy_region(const Texture& texture, cons
     };
 }
 
-void emit_root_data(CommandBuffer* commands, ByteSpan root) noexcept
+namespace
 {
-    if (root.size == 0)
+VkBufferImageCopy2 buffer_texture_copy_region(const VkDeviceMemoryImageCopyKHR& region, uint64 offset) noexcept
+{
+    return {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+        .bufferOffset = offset,
+        .bufferRowLength = region.addressRowLength,
+        .bufferImageHeight = region.addressImageHeight,
+        .imageSubresource = region.imageSubresource,
+        .imageOffset = region.imageOffset,
+        .imageExtent = region.imageExtent,
+    };
+}
+
+void bind_indices(CommandBuffer* commands, GpuRange indices, IndexType type) noexcept
+{
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(indices, &offset));
+        vkCmdBindIndexBuffer2(commands->command_buffer, buffer, offset, indices.size, static_cast<VkIndexType>(type));
         return;
-    assert(commands->state);
+    }
+    const VkBindIndexBuffer3InfoKHR info{
+        .sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
+        .addressRange = {
+            .address = static_cast<VkDeviceAddress>(reinterpret_cast<uintptr>(indices.gpu)),
+            .size = indices.size,
+        },
+        .addressFlags = address_flags,
+        .indexType = static_cast<VkIndexType>(type),
+    };
+    commands->state->fn.cmd_bind_index_buffer(commands->command_buffer, &info);
+}
+
+void emit_root_pointer(CommandBuffer* commands, const void* root) noexcept
+{
+    if (!root) return;
+    assert((reinterpret_cast<uintptr>(root) & 15u) == 0);
     const VkPushDataInfoEXT info{
         .sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
-        .data = {
-            .address = root.data,
-            .size = root.size,
-        },
+        .data = {.address = &root, .size = sizeof(root)},
     };
     commands->state->fn.cmd_push_data(commands->command_buffer, &info);
 }
+}
 
-void set_texture_descriptor_heap(CommandBuffer* commands, GpuRange heap) noexcept
+void set_texture_descriptor_heap(CommandBuffer* commands, TextureDescriptorHeap* heap) noexcept
 {
-    assert(commands && commands->state);
+    assert(commands && heap && commands->state == heap->state);
     const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties = commands->state->heap_properties;
     VkBindHeapInfoEXT bind_info{};
     make_heap_bind_info(
-        heap,
+        gpu_range(heap->storage),
         properties.imageDescriptorAlignment > properties.bufferDescriptorAlignment
             ? properties.imageDescriptorAlignment
             : properties.bufferDescriptorAlignment,
@@ -3392,12 +3790,12 @@ void set_texture_descriptor_heap(CommandBuffer* commands, GpuRange heap) noexcep
     commands->state->fn.cmd_bind_texture_heap(commands->command_buffer, &bind_info);
 }
 
-void set_sampler_descriptor_heap(CommandBuffer* commands, GpuRange heap) noexcept
+void set_sampler_descriptor_heap(CommandBuffer* commands, SamplerDescriptorHeap* heap) noexcept
 {
-    assert(commands && commands->state);
+    assert(commands && heap && commands->state == heap->state);
     const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties = commands->state->heap_properties;
     VkBindHeapInfoEXT bind_info{};
-    make_heap_bind_info(heap, properties.samplerDescriptorAlignment, properties.minSamplerHeapReservedRange, bind_info);
+    make_heap_bind_info(gpu_range(heap->storage), properties.samplerDescriptorAlignment, properties.minSamplerHeapReservedRange, bind_info);
     commands->state->fn.cmd_bind_sampler_heap(commands->command_buffer, &bind_info);
 }
 
@@ -3451,7 +3849,7 @@ void set_depth_stencil(CommandBuffer* commands, const DepthStencilState& state) 
     vkCmdSetStencilReference(commands->command_buffer, VK_STENCIL_FACE_BACK_BIT, state.back.reference);
 }
 
-void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexcept
+void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc, RenderingFlags flags) noexcept
 {
     assert(commands && (desc.colors.size == 0 || desc.colors.data) && desc.colors.size <= max_color_attachments);
     const RenderView* area_view = desc.colors.size ? desc.colors.data[0].render_view
@@ -3503,6 +3901,7 @@ void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexc
     };
     const VkRenderingInfo rendering_info{
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .flags = static_cast<VkRenderingFlags>(flags),
         .renderArea = {
             .extent = {.width = area_view->width, .height = area_view->height},
         },
@@ -3525,35 +3924,33 @@ void end_render_pass(CommandBuffer* commands) noexcept
     vkCmdEndRendering(commands->command_buffer);
 }
 
-void draw(CommandBuffer* commands, ByteSpan root, uint32 vertex_count, uint32 instance_count, uint32 first_vertex, uint32 first_instance) noexcept
+void draw(CommandBuffer* commands, const void* root, uint32 vertex_count, uint32 instance_count, uint32 first_vertex, uint32 first_instance) noexcept
 {
     assert(commands);
-    emit_root_data(commands, root);
+    emit_root_pointer(commands, root);
     vkCmdDraw(commands->command_buffer, vertex_count, instance_count, first_vertex, first_instance);
 }
 
-void draw_indexed(CommandBuffer* commands, ByteSpan root, GpuRange indices, IndexType type, uint32 index_count, uint32 instance_count, uint32 first_index,
+void draw_indexed(CommandBuffer* commands, const void* root, GpuRange indices, IndexType type, uint32 index_count, uint32 instance_count, uint32 first_index,
                   int32 vertex_offset, uint32 first_instance) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
-    const VkBindIndexBuffer3InfoKHR bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
-        .addressRange = {
-            .address = static_cast<VkDeviceAddress>(reinterpret_cast<uintptr>(indices.gpu)),
-            .size = indices.size,
-        },
-        .addressFlags = address_flags,
-        .indexType = static_cast<VkIndexType>(type),
-    };
-    commands->state->fn.cmd_bind_index_buffer(commands->command_buffer, &bind_info);
+    emit_root_pointer(commands, root);
+    bind_indices(commands, indices, type);
     vkCmdDrawIndexed(commands->command_buffer, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
-void draw_indirect(CommandBuffer* commands, ByteSpan root, GpuRange arguments, uint32 draw_count, uint32 stride) noexcept
+void draw_indirect(CommandBuffer* commands, const void* root, GpuRange arguments, uint32 draw_count, uint32 stride) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
+    emit_root_pointer(commands, root);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(arguments, &offset));
+        vkCmdDrawIndirect(commands->command_buffer, buffer, offset, draw_count, stride == 0 ? sizeof(VkDrawIndirectCommand) : stride);
+        return;
+    }
     const VkDrawIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3567,21 +3964,19 @@ void draw_indirect(CommandBuffer* commands, ByteSpan root, GpuRange arguments, u
     commands->state->fn.cmd_draw_indirect(commands->command_buffer, &info);
 }
 
-void draw_indexed_indirect(CommandBuffer* commands, ByteSpan root, GpuRange indices, IndexType type, GpuRange arguments, uint32 draw_count,
+void draw_indexed_indirect(CommandBuffer* commands, const void* root, GpuRange indices, IndexType type, GpuRange arguments, uint32 draw_count,
                            uint32 stride) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
-    const VkBindIndexBuffer3InfoKHR bind_info{
-        .sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR,
-        .addressRange = {
-            .address = static_cast<VkDeviceAddress>(reinterpret_cast<uintptr>(indices.gpu)),
-            .size = indices.size,
-        },
-        .addressFlags = address_flags,
-        .indexType = static_cast<VkIndexType>(type),
-    };
-    commands->state->fn.cmd_bind_index_buffer(commands->command_buffer, &bind_info);
+    emit_root_pointer(commands, root);
+    bind_indices(commands, indices, type);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(arguments, &offset));
+        vkCmdDrawIndexedIndirect(commands->command_buffer, buffer, offset, draw_count, stride == 0 ? sizeof(VkDrawIndexedIndirectCommand) : stride);
+        return;
+    }
     const VkDrawIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3595,17 +3990,24 @@ void draw_indexed_indirect(CommandBuffer* commands, ByteSpan root, GpuRange indi
     commands->state->fn.cmd_draw_indexed_indirect(commands->command_buffer, &info);
 }
 
-void dispatch(CommandBuffer* commands, ByteSpan root, uint32x3 group_count) noexcept
+void dispatch(CommandBuffer* commands, const void* root, uint32x3 group_count) noexcept
 {
     assert(commands);
-    emit_root_data(commands, root);
+    emit_root_pointer(commands, root);
     vkCmdDispatch(commands->command_buffer, group_count.x, group_count.y, group_count.z);
 }
 
-void dispatch_indirect(CommandBuffer* commands, ByteSpan root, GpuRange arguments) noexcept
+void dispatch_indirect(CommandBuffer* commands, const void* root, GpuRange arguments) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
+    emit_root_pointer(commands, root);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(arguments, &offset));
+        vkCmdDispatchIndirect(commands->command_buffer, buffer, offset);
+        return;
+    }
     const VkDispatchIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DISPATCH_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3617,17 +4019,26 @@ void dispatch_indirect(CommandBuffer* commands, ByteSpan root, GpuRange argument
     commands->state->fn.cmd_dispatch_indirect(commands->command_buffer, &info);
 }
 
-void draw_meshlets(CommandBuffer* commands, ByteSpan root, uint32x3 group_count) noexcept
+void draw_meshlets(CommandBuffer* commands, const void* root, uint32x3 group_count) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
+    emit_root_pointer(commands, root);
     commands->state->fn.cmd_draw_mesh_tasks(commands->command_buffer, group_count.x, group_count.y, group_count.z);
 }
 
-void draw_meshlets_indirect(CommandBuffer* commands, ByteSpan root, GpuRange arguments, uint32 draw_count, uint32 stride) noexcept
+void draw_meshlets_indirect(CommandBuffer* commands, const void* root, GpuRange arguments, uint32 draw_count, uint32 stride) noexcept
 {
     assert(commands && commands->state);
-    emit_root_data(commands, root);
+    assert(commands->state->caps.indirect_mesh_draw);
+    emit_root_pointer(commands, root);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(arguments, &offset));
+        commands->state->fn.cmd_draw_mesh_tasks_indirect_buffer(
+            commands->command_buffer, buffer, offset, draw_count, stride == 0 ? sizeof(VkDrawMeshTasksIndirectCommandEXT) : stride);
+        return;
+    }
     const VkDrawIndirect2InfoKHR info{
         .sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_2_INFO_KHR,
         .addressRange = {
@@ -3644,6 +4055,28 @@ void draw_meshlets_indirect(CommandBuffer* commands, ByteSpan root, GpuRange arg
 void copy_memory(CommandBuffer* commands, GpuRange source, GpuRange destination) noexcept
 {
     assert(commands && commands->state);
+    if (commands->state->buffer_map)
+    {
+        uint64 source_offset;
+        uint64 destination_offset;
+        const VkBuffer source_buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(source, &source_offset));
+        const VkBuffer destination_buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(destination, &destination_offset));
+        const VkBufferCopy2 region{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
+            .srcOffset = source_offset,
+            .dstOffset = destination_offset,
+            .size = source.size,
+        };
+        const VkCopyBufferInfo2 info{
+            .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+            .srcBuffer = source_buffer,
+            .dstBuffer = destination_buffer,
+            .regionCount = 1,
+            .pRegions = &region,
+        };
+        vkCmdCopyBuffer2(commands->command_buffer, &info);
+        return;
+    }
     const VkDeviceMemoryCopyKHR region{
         .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
         .srcRange = {
@@ -3669,6 +4102,22 @@ void copy_memory_to_texture(CommandBuffer* commands, GpuRange source, Texture* d
 {
     assert(commands && commands->state && destination);
     const VkDeviceMemoryImageCopyKHR region = make_texture_copy_region(*destination, copy, source);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(source, &offset));
+        const VkBufferImageCopy2 buffer_region = buffer_texture_copy_region(region, offset);
+        const VkCopyBufferToImageInfo2 info{
+            .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+            .srcBuffer = buffer,
+            .dstImage = destination->image,
+            .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .regionCount = 1,
+            .pRegions = &buffer_region,
+        };
+        vkCmdCopyBufferToImage2(commands->command_buffer, &info);
+        return;
+    }
     const VkCopyDeviceMemoryImageInfoKHR info{
         .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
         .image = destination->image,
@@ -3682,6 +4131,22 @@ void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange d
 {
     assert(commands && commands->state && source);
     const VkDeviceMemoryImageCopyKHR region = make_texture_copy_region(*source, copy, destination);
+    if (commands->state->buffer_map)
+    {
+        uint64 offset;
+        const VkBuffer buffer = reinterpret_cast<VkBuffer>(commands->state->buffer_map->resolve(destination, &offset));
+        const VkBufferImageCopy2 buffer_region = buffer_texture_copy_region(region, offset);
+        const VkCopyImageToBufferInfo2 info{
+            .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+            .srcImage = source->image,
+            .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .dstBuffer = buffer,
+            .regionCount = 1,
+            .pRegions = &buffer_region,
+        };
+        vkCmdCopyImageToBuffer2(commands->command_buffer, &info);
+        return;
+    }
     const VkCopyDeviceMemoryImageInfoKHR info{
         .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
         .image = source->image,
@@ -3694,19 +4159,7 @@ void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange d
 void barrier(CommandBuffer* commands, Stage before, Access before_access, Stage after, Access after_access) noexcept
 {
     assert(commands);
-    const VkMemoryBarrier2 memory_barrier{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = to_vk(before),
-        .srcAccessMask = to_vk(before_access),
-        .dstStageMask = to_vk(after),
-        .dstAccessMask = to_vk(after_access),
-    };
-    const VkDependencyInfo dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &memory_barrier,
-    };
-    vkCmdPipelineBarrier2(commands->command_buffer, &dependency);
+    record_barrier(commands->command_buffer, before, before_access, after, after_access);
 }
 
 } // namespace gpu

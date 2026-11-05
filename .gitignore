@@ -1,7 +1,7 @@
 /build*/
 /cmake-build*/
-/tools/
-/.vs/
+/tools/slang-*
+/.vs*/
 CMakeFiles/
 /CMakeCache.txt
 /cmake_install.cmake

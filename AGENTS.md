@@ -1,6 +1,9 @@
 # Coding Guidelines
 
 - Write simple, efficient, minimal C/C++ code.
+- Target one fixed feature set on the latest GPUs and drivers. Avoid optional feature flags, feature queries, and fallback paths.
+  Require features universally supported across the target hardware; otherwise ask the user before adding them.
+  Preserve the supported baseline and any documented API capability exceptions. Do not silently emulate unsupported operations.
 - Do not add obvious comments such as "arguments must be live objects". C/C++ programmers already understand that using destroyed objects is invalid.
 - Do not add asserts or comments describing 32-bit overflow cases. The existing 32-bit ranges (about 4 billion elements or 4 GB) are sufficient.
 - Do not use C++ standard-library headers or facilities in project code, including utilities, examples, and tests.
@@ -35,9 +38,9 @@
 - Do not use PIMPL interfaces.
 - Avoid standard-library algorithms; prefer straightforward loops.
 - Do not use hash maps or ordered maps.
-- Do not use mutexes or atomics in the graphics API. The API is intentionally single-threaded and is not thread-safe yet. The utility
-  `BumpAllocator::allocate_atomic()` is the sole exception: it supports relaxed-atomic reservation of disjoint mapped ranges while allocation
-  lifetime and GPU submission remain caller-synchronized.
+- Queues and command pools are externally synchronized; independent pools, queues, resource creation, and timeline waits can run concurrently.
+  Keep ordinary recording, lookup and submission free of internal mutexes. Restrict synchronization to shared bookkeeping and native API requirements;
+  use atomics where appropriate, and keep diagnostic workarounds isolated from production paths. Document backend-specific exceptions with the implementation.
 - Avoid copying large user data structures. Prefer references to structures, and use spans for array data in structures and function parameters.
 - Use a custom span type represented by a pointer and size. It must support construction from an initializer list so variable-length arguments remain concise. An initializer list passed as a function argument remains alive through that function call; do not retain a span backed by it after the call returns.
 - Always pass `Span`, `ByteSpan`, and `GpuRange` function parameters by value. This allows the compiler to pass their pointer-and-size fields in registers instead of forcing a memory store/load round trip. Review all code against this rule after every change.
@@ -47,11 +50,17 @@
   behind preprocessor conditionals.
 - Keep each shader source file's CPU-shared declarations in its own matching shared header. Keep shader-specific root data and constants in that header;
   put types used by multiple shader files in a neutral common header.
+- Use shared (CPU/GPU) data headers for structs, enums, and constants. Do not put arbitrary C/C++ code in them behind `#if !defined(__SLANG__)` blocks.
+- NEVER read struct fields or other data from GPU memory on the CPU, including CPU-mapped allocations, except for explicit readback after GPU completion.
+  Prepare, inspect and modify data in cached CPU memory, then write it to GPU memory. Treat upload and descriptor mappings as write-only, including in examples and tests.
 - Always review code for performance issues before considering work complete.
+- Fix the demonstrated root cause of correctness failures. Do not use blanket resource retention, synchronization or other global overhead to silence diagnostics.
 - Line length is 160 characters. Please don't chop expressions to multiple lines if not needed.
 
 # Documentation Guidelines
 
+- Keep contributor rules generic. Put implementation details, limits, build commands and platform exceptions in their relevant documentation.
+- Describe the current design and remaining limitations. Remove obsolete workarounds and narratives about fixed intermediate versions.
 - Keep Markdown documentation short, precise, and focused on user-facing behavior and fidelity to the *No Graphics API* design. Emphasize GPU pointers,
   the root ABI, and relevant Vulkan extensions. Avoid obvious C/C++ conventions, internal plumbing, exhaustive `Desc` or API catalogs, and sample-specific
   asset or format details better left in source files. Keep example descriptions brief.

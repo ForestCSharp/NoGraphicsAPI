@@ -22,6 +22,7 @@ public:
     TextureAllocator(TextureAllocator&&) = delete;
     TextureAllocator& operator=(TextureAllocator&&) = delete;
 
+    // Returns an uninitialized texture. Externally synchronize this allocator.
     // An empty result reports exhausted heap space. Free once with the same allocator after all views and GPU use have finished.
     [[nodiscard]] PlacedTexture allocate(const TextureDesc& desc) noexcept;
     void free(PlacedTexture& texture) noexcept;
