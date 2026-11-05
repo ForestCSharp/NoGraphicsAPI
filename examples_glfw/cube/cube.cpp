@@ -11,6 +11,7 @@
 #include <NoGraphicsAPIUtility/bump_allocator.hpp>
 #include <NoGraphicsAPIUtility/math.hpp>
 #include <NoGraphicsAPIUtility/texture_allocator.hpp>
+#include <NoGraphicsAPIUtility/upload_queue.hpp>
 
 #include <assert.h>
 #include <stdio.h>
@@ -78,7 +79,7 @@ namespace {
 
 namespace {
 
-Span<uint32> read_spirv(const char* path) noexcept
+Span<byte> read_shader(const char* path) noexcept
 {
 	assert(path);
 	FILE* file = fopen(path, "rb");
@@ -103,10 +104,10 @@ Span<uint32> read_spirv(const char* path) noexcept
 	}
 	rewind(file);
 
-	Span<uint32> code(static_cast<uint32*>(malloc(size_t(byte_count))), size_t(byte_count) / sizeof(uint32));
-	const bool read_succeeded = fread(code.data, sizeof(uint32), code.size, file) == code.size;
+	Span<byte> code(static_cast<byte*>(malloc(size_t(byte_count))), size_t(byte_count));
+	const bool read_succeeded = fread(code.data, 1, code.size, file) == code.size;
 	fclose(file);
-	if (!read_succeeded || code.data[0] != 0x07230203u)
+	if (!read_succeeded || *reinterpret_cast<uint32*>(code.data) != 0x07230203u)
 	{
 		fprintf(stderr, "Invalid SPIR-V file: %s\n", path);
 		free(code.data);
@@ -193,34 +194,45 @@ int main() {
 	printf("Using %s\n", caps.device_name);
 
 	// Shaders
-	const Span<uint32> vertex_spirv = read_spirv(NOGRAPHICSAPI_CUBE_VERTEX_SPV_PATH);
-	const Span<uint32> fragment_spirv = read_spirv(NOGRAPHICSAPI_CUBE_FRAGMENT_SPV_PATH);
+	const Span<byte> vertex_code = read_shader(NOGRAPHICSAPI_CUBE_VERTEX_SHADER_PATH);
+	const Span<byte> fragment_code = read_shader(NOGRAPHICSAPI_CUBE_FRAGMENT_SHADER_PATH);
 	PSO* cube_pso = create_graphics_pso(device, {
-		.vertex_spirv = vertex_spirv,
-		.fragment_spirv = fragment_spirv,
+		.vertex = {.code = {vertex_code.data, vertex_code.size}, .entry_point = "vertexMain"},
+		.fragment = {.code = {fragment_code.data, fragment_code.size}, .entry_point = "fragmentMain"},
 		.color_targets = {{.format = Format::bgra8_srgb}},
 		.depth_format = Format::d32_float,
 		.rasterization = { .cull = CullMode::clockwise },
 	});
-	free(fragment_spirv.data);
-	free(vertex_spirv.data);
+	free(fragment_code.data);
+	free(vertex_code.data);
+	if (!cube_pso)
+	{
+		destroy_device(device);
+		glfwDestroyWindow(window);
+		glfwTerminate();
+		return 1;
+	}
 
 	// GPU resources
 	GpuHeap data_heap = create_gpu_heap(device, data_heap_size);
 	BumpAllocator data_allocator(data_heap.range);
+	const GpuCpuRange<byte> frame_ranges[2]{data_allocator.allocate(4096), data_allocator.allocate(4096)};
 	const GpuCpuRange<CubeVertex> vertex_allocation = data_allocator.allocate<CubeVertex>(cube_vertex_count);
 	const GpuCpuRange<uint16> index_allocation = data_allocator.allocate<uint16>(cube_index_count);
-	const GpuCpuRange<byte> upload_allocation = data_allocator.allocate(texture_byte_count);
+	byte* texture_bytes = new byte[texture_byte_count];
 	memcpy(vertex_allocation.cpu, cube_vertices, sizeof(cube_vertices));
 	memcpy(index_allocation.cpu, cube_indices, sizeof(cube_indices));
-	read_binary_file(NOGRAPHICSAPI_CUBE_TEXTURE_PATH, Span<byte>(upload_allocation.cpu, texture_byte_count));
+	read_binary_file(NOGRAPHICSAPI_CUBE_TEXTURE_PATH, Span<byte>(texture_bytes, texture_byte_count));
 
-	GpuHeap texture_descriptor_heap = create_gpu_heap(device, caps.texture_descriptor_size, MemoryType::texture_descriptor_heap);
-	GpuHeap sampler_descriptor_heap = create_gpu_heap(device, caps.sampler_descriptor_size, MemoryType::sampler_descriptor_heap);
+	UploadQueue uploads(device, texture_byte_count);
+	TextureDescriptorHeap* texture_descriptor_heap = create_texture_descriptor_heap(device, 1);
+	SamplerDescriptorHeap* sampler_descriptor_heap = create_sampler_descriptor_heap(device, 1);
 	TextureHeap texture_heap = create_texture_heap(device, texture_heap_size);
 	TextureAllocator texture_allocator(device, texture_heap, 16);
 
 	TimelinePoint latest_completion{.semaphore = create_timeline_semaphore(device)};
+	CommandPool* command_pools[] = {create_command_pool(device), create_command_pool(device)};
+	CommandBuffer* texture_commands = begin_commands(command_pools[0]);
 
 	// Textures
 	PlacedTexture texture = texture_allocator.allocate({
@@ -229,23 +241,21 @@ int main() {
 		.usage = TextureUsage::sampled | TextureUsage::transfer_destination,
 	});
 
-	write_texture_descriptor(device, texture_descriptor_heap.range.cpu, texture.texture, TextureDescriptorType::sampled);
-	write_sampler_descriptor(device, sampler_descriptor_heap.range.cpu, {
+	initialize_texture(texture_commands, texture.texture);
+	write_texture_descriptor(texture_descriptor_heap, 0, texture.texture, TextureDescriptorType::sampled);
+	write_sampler_descriptor(sampler_descriptor_heap, 0, {
 		.min_filter = Filter::nearest,
 		.mag_filter = Filter::nearest,
 		.address_u = AddressMode::clamp_to_edge,
 		.address_v = AddressMode::clamp_to_edge,
 	});
-
-	CommandBuffer* upload_commands = begin_commands(device);
-	copy_memory_to_texture(upload_commands, gpu_range(upload_allocation), texture.texture);
-
-	barrier(upload_commands,
-		Stage::transfer, Access::transfer_write,
-		Stage::fragment, Access::shader_read);
-
+	end_commands(texture_commands);
 	latest_completion.value++;
-	submit({ upload_commands }, latest_completion);
+	submit(device, {.commands = {texture_commands}, .completion = latest_completion});
+	uploads.upload_texture(texture.texture, {texture_bytes, texture_byte_count});
+	delete[] texture_bytes;
+	uploads.wait();
+	uploads.destroy();
 
 	PlacedTexture depth{};
 	RenderView* depth_render_view = nullptr;
@@ -258,7 +268,13 @@ int main() {
 		glfwPollEvents();
 		if (glfwWindowShouldClose(window))
 			break;
-		const SwapchainFrame frame = acquire(device);
+		if (latest_completion.value >= 2)
+			wait_timeline({.semaphore = latest_completion.semaphore, .value = latest_completion.value - 1});
+		BumpAllocator frame_data(frame_ranges[latest_completion.value % 2]);
+		CommandPool* command_pool = command_pools[latest_completion.value % 2];
+		reset_command_pool(command_pool);
+		CommandBuffer* commands = begin_commands(command_pool);
+		const SwapchainFrame frame = acquire(commands);
 		if (!frame.render_view)
 			continue;
 
@@ -274,14 +290,14 @@ int main() {
 				.format = Format::d32_float,
 				.usage = TextureUsage::depth_stencil_attachment,
 			});
+			initialize_texture(commands, depth.texture);
 			depth_render_view = create_render_view(depth.texture);
 			depth_extent = frame.extent;
 		}
 
 		// Render
-		CommandBuffer* commands = begin_commands(device);
-		set_texture_descriptor_heap(commands, gpu_range(texture_descriptor_heap));
-		set_sampler_descriptor_heap(commands, gpu_range(sampler_descriptor_heap));
+		set_texture_descriptor_heap(commands, texture_descriptor_heap);
+		set_sampler_descriptor_heap(commands, sampler_descriptor_heap);
 
 		barrier(commands,
 			Stage::depth_stencil_tests, Access::depth_stencil_write,
@@ -304,33 +320,37 @@ int main() {
 		bind_pso(commands, cube_pso);
 
 		float4x4 projection = math::perspective_rh_zo(45.0f * math::pi / 180.0f,
-		                                             float(frame.extent.x) / float(frame.extent.y), 0.1f, 100.0f);
+													 float(frame.extent.x) / float(frame.extent.y), 0.1f, 100.0f);
 		projection.rows[1].y = -projection.rows[1].y;
-		const CubeRootArguments root {
+		const GpuCpuRange<CubeRootArguments> root = frame_data.allocate<CubeRootArguments>();
+		*root.cpu = {
 			.vertices = vertex_allocation.gpu,
 			.transform = projection * view * math::rotation_y(radians_per_frame * float(frame_index++)),
 		};
 
-		draw_indexed(commands, root, gpu_range(index_allocation), IndexType::uint16, cube_index_count);
+		draw_indexed(commands, root.gpu, gpu_range(index_allocation), IndexType::uint16, cube_index_count);
 
 		end_render_pass(commands);
 
 		// Submit
+		end_commands(commands);
 		latest_completion.value++;
-		submit_and_present(device, {commands}, latest_completion);
+		submit_and_present(device, {.commands = {commands}, .completion = latest_completion});
 	}
 
 	wait_idle(device);
 
 	// Cleanup
+	destroy_command_pool(command_pools[1]);
+	destroy_command_pool(command_pools[0]);
 	destroy_timeline_semaphore(latest_completion.semaphore);
 	destroy_pso(cube_pso);
 	destroy_render_view(depth_render_view);
 	texture_allocator.free(depth);
 	texture_allocator.free(texture);
 	destroy_texture_heap(texture_heap);
-	destroy_gpu_heap(sampler_descriptor_heap);
-	destroy_gpu_heap(texture_descriptor_heap);
+	destroy_sampler_descriptor_heap(sampler_descriptor_heap);
+	destroy_texture_descriptor_heap(texture_descriptor_heap);
 	destroy_gpu_heap(data_heap);
 
 	destroy_device(device);

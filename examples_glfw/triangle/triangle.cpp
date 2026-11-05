@@ -13,7 +13,7 @@ using namespace gpu;
 namespace
 {
 
-Span<uint32> read_spirv(const char* path) noexcept
+Span<byte> read_shader(const char* path) noexcept
 {
     assert(path);
     FILE* file = fopen(path, "rb");
@@ -38,10 +38,10 @@ Span<uint32> read_spirv(const char* path) noexcept
     }
     rewind(file);
 
-    Span<uint32> code(static_cast<uint32*>(malloc(size_t(byte_count))), size_t(byte_count) / sizeof(uint32));
-    const bool read_succeeded = fread(code.data, sizeof(uint32), code.size, file) == code.size;
+    Span<byte> code(static_cast<byte*>(malloc(size_t(byte_count))), size_t(byte_count));
+    const bool read_succeeded = fread(code.data, 1, code.size, file) == code.size;
     fclose(file);
-    if (!read_succeeded || code.data[0] != 0x07230203u)
+    if (!read_succeeded || *reinterpret_cast<uint32*>(code.data) != 0x07230203u)
     {
         fprintf(stderr, "Invalid SPIR-V file: %s\n", path);
         free(code.data);
@@ -110,41 +110,56 @@ int main()
 
     printf("Using %s\n", get_device_caps(device).device_name);
 
-    const Span<uint32> vertex_spirv = read_spirv(NOGRAPHICSAPI_VERTEX_SPV_PATH);
-    const Span<uint32> fragment_spirv = read_spirv(NOGRAPHICSAPI_FRAGMENT_SPV_PATH);
+    const Span<byte> vertex_code = read_shader(NOGRAPHICSAPI_VERTEX_SHADER_PATH);
+    const Span<byte> fragment_code = read_shader(NOGRAPHICSAPI_FRAGMENT_SHADER_PATH);
     PSO* triangle_pso = create_graphics_pso(device, {
-        .vertex_spirv = vertex_spirv,
-        .fragment_spirv = fragment_spirv,
+        .vertex = {.code = {vertex_code.data, vertex_code.size}, .entry_point = "vertexMain"},
+        .fragment = {.code = {fragment_code.data, fragment_code.size}, .entry_point = "fragmentMain"},
         .color_targets = { { .format = Format::bgra8_srgb } }
     });
-    free(fragment_spirv.data);
-    free(vertex_spirv.data);
+    free(fragment_code.data);
+    free(vertex_code.data);
+    if (!triangle_pso)
+    {
+        destroy_device(device);
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
 
     glfwSetKeyCallback(window, key_callback);
 
     TimelinePoint latest_completion{ .semaphore = create_timeline_semaphore(device) };
+    CommandPool* command_pools[] = {create_command_pool(device), create_command_pool(device)};
 
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
         if (glfwWindowShouldClose(window))
             break;
-        const SwapchainFrame frame = acquire(device);
+        if (latest_completion.value >= 2)
+            wait_timeline({.semaphore = latest_completion.semaphore, .value = latest_completion.value - 1});
+        CommandPool* command_pool = command_pools[latest_completion.value % 2];
+        reset_command_pool(command_pool);
+        CommandBuffer* commands = begin_commands(command_pool);
+        const SwapchainFrame frame = acquire(commands);
         if (!frame.render_view)
             continue;
-        CommandBuffer* commands = begin_commands(device);
         begin_render_pass(commands, {
             .colors = { { .render_view = frame.render_view, .load = LoadOp::clear } },
         });
         bind_pso(commands, triangle_pso);
         draw(commands, {}, 3);
         end_render_pass(commands);
+        end_commands(commands);
         latest_completion.value++;
-        submit_and_present(device, { commands }, latest_completion);
+        submit_and_present(device, {.commands = {commands}, .completion = latest_completion});
     }
 
     wait_idle(device);
 
+    destroy_command_pool(command_pools[1]);
+    destroy_command_pool(command_pools[0]);
     destroy_timeline_semaphore(latest_completion.semaphore);
     destroy_pso(triangle_pso);
 
